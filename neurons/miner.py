@@ -60,7 +60,7 @@ class Miner(BaseMinerNeuron):
                 "model_version": "1.0.0",
                 "framework": "scikit-learn",
                 "license": "MIT",
-                "repo_url": "https://github.com/Poker44/Poker44-subnet",
+                "repo_url": "https://github.com/Xayaan/poker44-claude",
                 "notes": (
                     "HistGradientBoosting ensemble + logistic blend over "
                     "chunk-size-invariant behavioral features (sequence-collision "

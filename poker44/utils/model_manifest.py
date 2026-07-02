@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
@@ -42,6 +43,21 @@ def _sha256_for_files(paths: Iterable[Path]) -> str:
     return digest.hexdigest()
 
 
+def _git_commit_for_repo(repo_root: Path) -> str:
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except Exception:
+        return ""
+    return completed.stdout.strip()
+
+
 def build_local_model_manifest(
     *,
     repo_root: Path,
@@ -52,6 +68,12 @@ def build_local_model_manifest(
     implementation_paths = [path.resolve() for path in implementation_files]
     implementation_sha256 = _sha256_for_files(implementation_paths)
     default_values = dict(defaults or {})
+    repo_commit = os.getenv(
+        "POKER44_MODEL_REPO_COMMIT",
+        str(default_values.get("repo_commit", "")),
+    ).strip()
+    if not repo_commit:
+        repo_commit = _git_commit_for_repo(repo_root)
 
     manifest: Dict[str, Any] = {
         "schema_version": "1",
@@ -81,7 +103,7 @@ def build_local_model_manifest(
         ).strip(),
         "repo_commit": os.getenv(
             "POKER44_MODEL_REPO_COMMIT",
-            str(default_values.get("repo_commit", "")),
+            repo_commit,
         ).strip(),
         "artifact_url": os.getenv(
             "POKER44_MODEL_ARTIFACT_URL",
