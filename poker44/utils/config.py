@@ -22,6 +22,12 @@ def add_args(cls, parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--netuid", type=int, help="Subnet netuid", default=126)
     
     parser.add_argument(
+        "--neuron.name",
+        type=str,
+        default="miner",
+        help="Name used for local neuron logs and state directory.",
+    )
+    parser.add_argument(
         "--neuron.device",
         type=str,
         default="cpu",
@@ -166,6 +172,11 @@ def add_miner_args(cls, parser: argparse.ArgumentParser) -> None:
 
 def check_config(cls, config: "bt.Config"):
     r"""Checks/validates the config namespace object."""
+    if getattr(config, "neuron", None) is None:
+        config.neuron = bt.Config()
+    if getattr(config.neuron, "name", None) is None:
+        config.neuron.name = "miner"
+
     full_path = os.path.expanduser(
         "{}/{}/{}/netuid{}/{}".format(
             config.logging.logging_dir,  # TODO: change from ~/.bittensor/miners to ~/.bittensor/neurons
@@ -188,6 +199,7 @@ def check_config(cls, config: "bt.Config"):
 
 
 def config(cls) -> bt.Config:
+    os.environ.setdefault("BT_NO_PARSE_CLI_ARGS", "0")
     parser = argparse.ArgumentParser()
     cls.add_args(parser)
     return bt.Config(parser=parser)

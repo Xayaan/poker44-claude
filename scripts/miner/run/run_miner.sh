@@ -8,6 +8,7 @@ HOTKEY="${HOTKEY:-poker44-miner-hk}"
 NETWORK="${NETWORK:-finney}"
 MINER_SCRIPT="${MINER_SCRIPT:-./neurons/miner.py}"
 PM2_NAME="${PM2_NAME:-poker44_miner}"  ##  name of Miner, as you wish
+NEURON_NAME="${NEURON_NAME:-miner}"
 AXON_PORT="${AXON_PORT:-8091}"
 ALLOWED_VALIDATOR_HOTKEYS="${ALLOWED_VALIDATOR_HOTKEYS:-}"
 
@@ -24,9 +25,11 @@ fi
 pm2 delete $PM2_NAME 2>/dev/null || true
 
 export PYTHONPATH="$(pwd)"
+export BT_NO_PARSE_CLI_ARGS="${BT_NO_PARSE_CLI_ARGS:-0}"
 
 MINER_ARGS=(
   --netuid "$NETUID"
+  --neuron.name "$NEURON_NAME"
   --wallet.name "$WALLET_NAME"
   --wallet.hotkey "$HOTKEY"
   --subtensor.network "$NETWORK"
