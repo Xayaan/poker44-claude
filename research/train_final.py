@@ -115,6 +115,12 @@ def main() -> None:
     size_mb = MODEL_PATH.stat().st_size / 1e6
     print(f"saved {MODEL_PATH.name} ({size_mb:.1f} MB) + {META_PATH.name}")
 
+    # numpy-native production artifact + parity proof (see export_v2.py)
+    import export_v2
+
+    export_v2.export()
+    export_v2.verify_parity()
+
 
 if __name__ == "__main__":
     main()

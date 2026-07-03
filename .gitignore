@@ -221,3 +221,7 @@ research/dataset.pkl
 research/features_cache.pkl
 research/feat_explore.pkl
 research/model_holdout.pkl
+
+# local session context (never publish)
+-Users-zayaan-1-Downloads-poker44-claude/
+poker44-claude.md

@@ -2,13 +2,18 @@
 
 Loads the trained artifact once and scores whole requests (all chunks of a
 DetectionSynapse together, so batch-relative features mirror training).
-Falls back to a deterministic heuristic if the artifact is unavailable so the
-miner never drops a response.
+
+Artifact preference order:
+  1. model_v2.npz  — numpy-native export of the ensemble (flat arrays, no
+     pickle, no scikit-learn at inference; immune to library version drift)
+  2. model.pkl     — original scikit-learn pickle (requires a compatible
+     scikit-learn/numpy at runtime)
+  3. deterministic heuristic — so the miner never drops a response.
 """
 
 from __future__ import annotations
 
-import pickle
+import json
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -18,39 +23,159 @@ import numpy as np
 from poker44.detection.features import FEATURE_NAMES, extract_chunk_features
 
 MODEL_PATH = Path(__file__).resolve().parent / "model.pkl"
+MODEL_V2_PATH = Path(__file__).resolve().parent / "model_v2.npz"
 _NEUTRAL_SCORE = 0.5
+
+
+class _NumpyEnsemble:
+    """Dependency-free predictor for the exported HistGB + LR blend.
+
+    Replicates scikit-learn HistGradientBoostingClassifier inference exactly:
+    per tree, walk nodes comparing x[feature_idx] <= threshold (NaN follows
+    missing_go_to_left); sum leaf values onto the baseline; sigmoid. The six
+    GBM probabilities are averaged, then blended with a standardized logistic
+    regression.
+    """
+
+    def __init__(self, npz: Any):
+        self.n_gbms = int(npz["n_gbms"][0])
+        self.n_features = int(npz["n_features"][0])
+        self.lr_weight = float(npz["lr_weight"][0])
+        self.gbms = []
+        for g in range(self.n_gbms):
+            self.gbms.append(
+                {
+                    "tree_starts": npz[f"g{g}_tree_starts"].astype(np.int64),
+                    "feature_idx": npz[f"g{g}_feature_idx"].astype(np.int64),
+                    "threshold": npz[f"g{g}_threshold"].astype(np.float64),
+                    "left": npz[f"g{g}_left"].astype(np.int64),
+                    "right": npz[f"g{g}_right"].astype(np.int64),
+                    "is_leaf": npz[f"g{g}_is_leaf"].astype(bool),
+                    "missing_left": npz[f"g{g}_missing_left"].astype(bool),
+                    "value": npz[f"g{g}_value"].astype(np.float64),
+                    "baseline": float(npz[f"g{g}_baseline"][0]),
+                }
+            )
+        self.lr_mean = npz["lr_mean"].astype(np.float64)
+        self.lr_scale = npz["lr_scale"].astype(np.float64)
+        self.lr_coef = npz["lr_coef"].astype(np.float64).ravel()
+        self.lr_intercept = float(npz["lr_intercept"][0])
+
+    @staticmethod
+    def _sigmoid(raw: np.ndarray) -> np.ndarray:
+        out = np.empty_like(raw)
+        pos = raw >= 0
+        out[pos] = 1.0 / (1.0 + np.exp(-raw[pos]))
+        e = np.exp(raw[~pos])
+        out[~pos] = e / (1.0 + e)
+        return out
+
+    def _gbm_raw(self, gbm: Dict[str, np.ndarray], X: np.ndarray) -> np.ndarray:
+        n = X.shape[0]
+        raw = np.full(n, gbm["baseline"], dtype=np.float64)
+        starts = gbm["tree_starts"]
+        is_leaf = gbm["is_leaf"]
+        feature_idx = gbm["feature_idx"]
+        threshold = gbm["threshold"]
+        left = gbm["left"]
+        right = gbm["right"]
+        missing_left = gbm["missing_left"]
+        value = gbm["value"]
+        rows = np.arange(n)
+        for t in range(len(starts) - 1):
+            base = starts[t]
+            cur = np.full(n, base, dtype=np.int64)
+            active = ~is_leaf[cur]
+            # bounded walk: HistGB trees are shallow; 64 covers any depth
+            for _ in range(64):
+                if not active.any():
+                    break
+                idx = cur[active]
+                x = X[rows[active], feature_idx[idx]]
+                thr = threshold[idx]
+                go_left = np.where(np.isnan(x), missing_left[idx], x <= thr)
+                cur[active] = base + np.where(go_left, left[idx], right[idx])
+                active = ~is_leaf[cur]
+            raw += value[cur]
+        return raw
+
+    def predict_proba_1(self, X: np.ndarray) -> np.ndarray:
+        X = np.asarray(X, dtype=np.float64)
+        proba = np.zeros(X.shape[0], dtype=np.float64)
+        for gbm in self.gbms:
+            proba += self._sigmoid(self._gbm_raw(gbm, X))
+        proba /= float(self.n_gbms)
+        z = (X - self.lr_mean) / self.lr_scale
+        lr_p = self._sigmoid(z @ self.lr_coef + self.lr_intercept)
+        return (1.0 - self.lr_weight) * proba + self.lr_weight * lr_p
 
 
 class DetectionModel:
     """Thread-safe scorer: one risk score per chunk, higher = more bot-like."""
 
     def __init__(self, model_path: Optional[Path] = None):
+        self._explicit_path = model_path is not None
         self._path = Path(model_path) if model_path is not None else MODEL_PATH
         self._lock = threading.Lock()
+        self._numpy_model: Optional[_NumpyEnsemble] = None
         self._artifact: Optional[Dict[str, Any]] = None
         self._load_error: Optional[str] = None
+        self._engine = "heuristic"
         self._load()
 
     def _load(self) -> None:
+        errors: List[str] = []
+        if not self._explicit_path:
+            try:
+                self._load_npz(MODEL_V2_PATH)
+                self._engine = "numpy-v2"
+                self._load_error = None
+                return
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"npz: {type(exc).__name__}: {exc}")
         try:
-            with open(self._path, "rb") as fh:
-                artifact = pickle.load(fh)
-            if artifact.get("format") != "poker44-detection-v1":
-                raise ValueError(f"unexpected artifact format: {artifact.get('format')}")
-            if int(artifact.get("n_features", -1)) != len(FEATURE_NAMES):
-                raise ValueError(
-                    f"feature count mismatch: artifact={artifact.get('n_features')} "
-                    f"code={len(FEATURE_NAMES)}"
-                )
-            self._artifact = artifact
+            self._load_pickle(self._path)
+            self._engine = "sklearn-pickle-v1"
             self._load_error = None
+            return
         except Exception as exc:  # noqa: BLE001
-            self._artifact = None
-            self._load_error = f"{type(exc).__name__}: {exc}"
+            errors.append(f"pkl: {type(exc).__name__}: {exc}")
+        self._engine = "heuristic"
+        self._load_error = " | ".join(errors)
+
+    def _load_npz(self, path: Path) -> None:
+        with np.load(path, allow_pickle=False) as npz:
+            if str(npz["format"][0]) != "poker44-detection-v2":
+                raise ValueError(f"unexpected artifact format: {npz['format'][0]}")
+            model = _NumpyEnsemble(npz)
+        if model.n_features != 2 * len(FEATURE_NAMES):
+            raise ValueError(
+                f"feature count mismatch: artifact={model.n_features} "
+                f"code={2 * len(FEATURE_NAMES)}"
+            )
+        self._numpy_model = model
+
+    def _load_pickle(self, path: Path) -> None:
+        import pickle  # local: only the legacy path needs it
+
+        with open(path, "rb") as fh:
+            artifact = pickle.load(fh)
+        if artifact.get("format") != "poker44-detection-v1":
+            raise ValueError(f"unexpected artifact format: {artifact.get('format')}")
+        if int(artifact.get("n_features", -1)) != len(FEATURE_NAMES):
+            raise ValueError(
+                f"feature count mismatch: artifact={artifact.get('n_features')} "
+                f"code={len(FEATURE_NAMES)}"
+            )
+        self._artifact = artifact
 
     @property
     def ready(self) -> bool:
-        return self._artifact is not None
+        return self._numpy_model is not None or self._artifact is not None
+
+    @property
+    def engine(self) -> str:
+        return self._engine
 
     @property
     def load_error(self) -> Optional[str]:
@@ -62,12 +187,27 @@ class DetectionModel:
         if not chunks:
             return []
         try:
-            return self._score_chunks_model(chunks)
+            scores = self._score_chunks_model(chunks)
         except Exception:  # noqa: BLE001
-            return [self._heuristic_chunk(chunk) for chunk in chunks]
+            scores = [self._heuristic_chunk(chunk) for chunk in chunks]
+        if len(scores) != len(chunks):  # defensive; should be unreachable
+            scores = [self._heuristic_chunk(chunk) for chunk in chunks]
+        return scores
+
+    def _predict_proba(self, X: np.ndarray) -> np.ndarray:
+        with self._lock:
+            if self._numpy_model is not None:
+                return self._numpy_model.predict_proba_1(X)
+            if self._artifact is not None:
+                gbms = self._artifact["gbms"]
+                lr = self._artifact["lr"]
+                lr_weight = float(self._artifact.get("lr_weight", 0.15))
+                proba = np.mean([m.predict_proba(X)[:, 1] for m in gbms], axis=0)
+                return (1.0 - lr_weight) * proba + lr_weight * lr.predict_proba(X)[:, 1]
+        raise RuntimeError("no artifact loaded")
 
     def _score_chunks_model(self, chunks: List[List[dict]]) -> List[float]:
-        if self._artifact is None:
+        if not self.ready:
             return [self._heuristic_chunk(chunk) for chunk in chunks]
 
         absolute = np.vstack([self._safe_features(chunk) for chunk in chunks])
@@ -77,12 +217,7 @@ class DetectionModel:
             relative = np.zeros_like(absolute)
         X = np.hstack([absolute, relative])
 
-        with self._lock:
-            gbms = self._artifact["gbms"]
-            lr = self._artifact["lr"]
-            lr_weight = float(self._artifact.get("lr_weight", 0.15))
-            proba = np.mean([m.predict_proba(X)[:, 1] for m in gbms], axis=0)
-            proba = (1.0 - lr_weight) * proba + lr_weight * lr.predict_proba(X)[:, 1]
+        proba = self._predict_proba(X)
 
         scores: List[float] = []
         for chunk, p in zip(chunks, proba):
@@ -147,6 +282,35 @@ class DetectionModel:
             return min(1.0, max(0.0, round(score, 6)))
         except Exception:  # noqa: BLE001
             return _NEUTRAL_SCORE
+
+    def self_check(self) -> Dict[str, Any]:
+        """Score a tiny synthetic request end-to-end; used at miner startup to
+        prove which engine is live. Never raises."""
+        try:
+            hand = {
+                "actions": [
+                    {"action_type": "bet", "normalized_amount_bb": 4.0},
+                    {"action_type": "call", "normalized_amount_bb": 4.0},
+                ],
+                "players": [{}, {}],
+                "streets": [{}, {}],
+                "outcome": {},
+            }
+            chunks = [[dict(hand) for _ in range(4)], [dict(hand) for _ in range(3)]]
+            scores = self.score_chunks(chunks)
+            return {
+                "engine": self.engine,
+                "ready": self.ready,
+                "scores": scores,
+                "load_error": self.load_error,
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "engine": self.engine,
+                "ready": self.ready,
+                "scores": None,
+                "load_error": f"self_check: {type(exc).__name__}: {exc}",
+            }
 
 
 _default_model: Optional[DetectionModel] = None

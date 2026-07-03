@@ -41,12 +41,19 @@ class Miner(BaseMinerNeuron):
         repo_root = Path(__file__).resolve().parents[1]
         self.detector = get_default_model()
         if self.detector.ready:
-            bt.logging.info("Detection ensemble loaded (poker44-detection-v1).")
+            bt.logging.info(
+                f"Detection ensemble loaded (engine={self.detector.engine})."
+            )
         else:
             bt.logging.warning(
                 f"Detection artifact unavailable ({self.detector.load_error}); "
                 "serving heuristic fallback. Run research/train_final.py to rebuild."
             )
+        check = self.detector.self_check()
+        bt.logging.info(
+            f"Detector self-check | engine={check['engine']} ready={check['ready']} "
+            f"scores={check['scores']} load_error={check['load_error']}"
+        )
         model_files = [
             Path(__file__).resolve(),
             repo_root / "poker44" / "detection" / "features.py",
@@ -57,8 +64,8 @@ class Miner(BaseMinerNeuron):
             implementation_files=[p for p in model_files if p.exists()],
             defaults={
                 "model_name": "poker44-seqcollision-ensemble",
-                "model_version": "1.0.0",
-                "framework": "scikit-learn",
+                "model_version": "2.0.0",
+                "framework": "numpy (HistGB export, trained with scikit-learn)",
                 "license": "MIT",
                 "repo_url": "https://github.com/Xayaan/poker44-claude",
                 "notes": (
@@ -137,9 +144,16 @@ class Miner(BaseMinerNeuron):
         synapse.model_manifest = dict(self.model_manifest)
         elapsed = time.monotonic() - started
         total_hands = sum(len(c) for c in chunks if isinstance(c, list))
+        if scores:
+            lo, hi = min(scores), max(scores)
+            mean = sum(scores) / len(scores)
+            stats = f"min={lo:.3f} mean={mean:.3f} max={hi:.3f}"
+        else:
+            stats = "empty"
         bt.logging.info(
             f"Scored {len(chunks)} chunks ({total_hands} hands) in {elapsed:.2f}s "
-            f"with {'ensemble' if self.detector.ready else 'heuristic fallback'}."
+            f"engine={self.detector.engine if self.detector.ready else 'heuristic fallback'} "
+            f"scores[{stats}]"
         )
         return synapse
 

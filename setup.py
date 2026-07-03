@@ -59,7 +59,9 @@ setup(
     license="MIT",
     packages=find_packages(),
     include_package_data=True,
-    package_data={"poker44.detection": ["model.pkl", "model_meta.json"]},
+    package_data={
+        "poker44.detection": ["model.pkl", "model_v2.npz", "model_meta.json"]
+    },
     install_requires=requirements,
     python_requires=">=3.10",
     classifiers=[

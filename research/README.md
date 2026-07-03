@@ -1,7 +1,11 @@
 # Poker44 Detection Research Pipeline
 
-Training and validation pipeline for the shipped detection model
-(`poker44/detection/model.pkl`, format `poker44-detection-v1`).
+Training and validation pipeline for the shipped detection model. Production
+inference uses `poker44/detection/model_v2.npz` (format `poker44-detection-v2`)
+— a numpy-native export of the ensemble: flat arrays only, loaded with
+`allow_pickle=False`, **no scikit-learn and no pickle at inference**, so it is
+immune to library version drift on the deploy host. `model.pkl` (v1, sklearn
+pickle) is kept as a research/secondary artifact.
 
 ## Pipeline
 
@@ -9,16 +13,28 @@ Training and validation pipeline for the shipped detection model
 .venv/bin/python research/download_benchmark.py   # fetch all benchmark releases (cache: research/data/)
 .venv/bin/python research/build_dataset.py        # project hands through the exact validator canonicalizer
 .venv/bin/python research/train.py                # leave-one-date-out CV experiments
-.venv/bin/python research/train_final.py          # train final ensemble -> poker44/detection/model.pkl
+.venv/bin/python research/train_final.py          # train final ensemble -> model.pkl + model_v2.npz (parity-checked)
+.venv/bin/python research/export_v2.py            # re-export npz from an existing model.pkl + parity proof
 .venv/bin/python research/parity_sim.py           # validator-parity forward-cycle simulation (temporal holdout)
 .venv-bt/bin/python research/wire_test.py         # real bt.Axon <-> bt.Dendrite loopback test
 ```
 
 Verified environment: Python 3.12/3.14, numpy 2.5.0, scikit-learn 1.9.0,
-bittensor 10.5.0. If the deploy host cannot unpickle the artifact (sklearn
-version drift), the miner logs the load error and serves the heuristic
-fallback; rebuild on the host with `research/train_final.py` (dataset cache
-required, ~2 min).
+bittensor 10.5.0 (training). Inference needs numpy only; a scikit-learn-free
+venv produces byte-identical scores (verified). Artifact preference at
+runtime: `model_v2.npz` → `model.pkl` → deterministic heuristic; the miner
+logs the active engine at startup (`Detector self-check | engine=...`) and on
+every scored request.
+
+## Incident note (2026-07-03, R1/R2 of the live cycle)
+
+Live R2 scored 0.463 ≈ the miner-level heuristic on that day's release
+(0.460), while the trained ensemble scored 0.703 out-of-sample on the same
+release — i.e. production served a fallback, not the ensemble (env drift or a
+dirty tree on the deploy host; v1 was a sklearn/numpy pickle and any
+unpickle/predict failure degrades silently). The v2 numpy artifact plus
+startup self-check + per-request engine logging make that failure class
+impossible / immediately visible.
 
 ## Model
 
