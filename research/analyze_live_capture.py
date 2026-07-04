@@ -25,7 +25,12 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from poker44.detection.features import FEATURE_NAMES, extract_chunk_features  # noqa: E402
+from poker44.detection.features import (  # noqa: E402
+    FEATURE_NAMES,
+    compute_request_context,
+    extract_chunk_features,
+    extract_features_matrix,
+)
 
 
 def load_captures(patterns: list[str]) -> list[dict]:
@@ -42,7 +47,7 @@ def load_captures(patterns: list[str]) -> list[dict]:
 
 
 def live_stats(reqs: list[dict]) -> np.ndarray:
-    all_chunks = []
+    all_rows = []
     for req in reqs:
         chunks = req.get("chunks") or []
         scores = req.get("scores") or []
@@ -78,16 +83,18 @@ def live_stats(reqs: list[dict]) -> np.ndarray:
         print(f"   hand key-sets: {[(list(k)[:8], v) for k, v in keysets.most_common(2)]}")
         print(f"   logged scores: min={s.min():.3f} med={np.median(s):.3f} mean={s.mean():.3f} max={s.max():.3f} "
               f"| frac in [0.4,0.6]: {float(np.mean((s >= 0.4) & (s <= 0.6))):.2f}")
-        all_chunks.extend(c for c in chunks if isinstance(c, list) and c)
-    X = np.vstack([_safe_feats(c) for c in all_chunks])
+        good = [c for c in chunks if isinstance(c, list) and c]
+        ctx = compute_request_context(good)
+        all_rows.extend(_safe_feats(c, ctx) for c in good)
+    X = np.vstack(all_rows)
     print(f"\nlive feature matrix: {X.shape[0]} chunks x {X.shape[1]} features "
           f"| zero-rows={int(np.sum(~X.any(axis=1)))}")
     return X
 
 
-def _safe_feats(chunk: list) -> np.ndarray:
+def _safe_feats(chunk: list, ctx=None) -> np.ndarray:
     try:
-        return extract_chunk_features(chunk)
+        return extract_chunk_features(chunk, ctx)
     except Exception:  # noqa: BLE001
         return np.zeros(len(FEATURE_NAMES), dtype=float)
 
@@ -100,7 +107,11 @@ def benchmark_compare(X_live: np.ndarray) -> None:
     dates = sorted({r["date"] for r in records})
     recent = set(dates[-7:])
     recs = [r for r in records if r["date"] in recent]
-    X_b = np.vstack([_safe_feats(r["hands"]) for r in recs])
+    ctx_by_date = {
+        d: compute_request_context([r["hands"] for r in recs if r["date"] == d])
+        for d in sorted(recent)
+    }
+    X_b = np.vstack([_safe_feats(r["hands"], ctx_by_date[r["date"]]) for r in recs])
     y_b = np.array([r["label"] for r in recs])
 
     med_b = np.median(X_b, axis=0)
@@ -131,8 +142,33 @@ def benchmark_compare(X_live: np.ndarray) -> None:
     print(f"benchmark score split: hum_med={float(np.median(p_b[y_b == 0])):.3f} bot_med={float(np.median(p_b[y_b == 1])):.3f}")
 
 
+def rescore(reqs: list[dict]) -> None:
+    """Rescore captured requests with the CURRENT local model (works on the
+    VPS; no dataset needed). Compares against the scores served at capture
+    time."""
+    from poker44.detection.model import DetectionModel
+
+    m = DetectionModel()
+    print(f"\nrescore engine={m.engine} ready={m.ready}")
+    for req in reqs:
+        chunks = req.get("chunks") or []
+        new = np.array(m.score_chunks(chunks), dtype=float)
+        old = np.array(req.get("scores") or [], dtype=float)
+        mid = float(np.mean((new >= 0.4) & (new <= 0.6))) if new.size else 0.0
+        line = (
+            f"req ts={req.get('ts')}: new scores min={new.min():.3f} "
+            f"med={float(np.median(new)):.3f} max={new.max():.3f} mid={mid:.0%}"
+        )
+        if old.size == new.size and old.size:
+            line += f" | served-at-capture mid={float(np.mean((old >= 0.4) & (old <= 0.6))):.0%}"
+        print(line)
+
+
 if __name__ == "__main__":
-    args = [a for a in sys.argv[1:] if a != "--benchmark"]
-    X_live = live_stats(load_captures(args))
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    reqs = load_captures(args)
+    X_live = live_stats(reqs)
     if "--benchmark" in sys.argv:
         benchmark_compare(X_live)
+    if "--rescore" in sys.argv:
+        rescore(reqs)

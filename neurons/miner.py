@@ -84,7 +84,7 @@ class Miner(BaseMinerNeuron):
             implementation_files=[p for p in model_files if p.exists()],
             defaults={
                 "model_name": "poker44-seqcollision-ensemble",
-                "model_version": "2.0.0",
+                "model_version": "2.1.0",
                 "framework": "numpy (HistGB export, trained with scikit-learn)",
                 "license": "MIT",
                 "repo_url": "https://github.com/Xayaan/poker44-claude",
@@ -172,7 +172,8 @@ class Miner(BaseMinerNeuron):
         if scores:
             lo, hi = min(scores), max(scores)
             mean = sum(scores) / len(scores)
-            stats = f"min={lo:.3f} mean={mean:.3f} max={hi:.3f}"
+            mid = sum(1 for s in scores if 0.4 <= s <= 0.6) / len(scores)
+            stats = f"min={lo:.3f} mean={mean:.3f} max={hi:.3f} mid={mid:.0%}"
         else:
             stats = "empty"
         bt.logging.info(

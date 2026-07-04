@@ -5,6 +5,14 @@ Operates on miner-visible hand payloads (the output of
 chunk-size invariant: rates, quantiles, and pairwise-collision U-statistics
 only, so scores stay stable whether a chunk holds 30 or 100+ hands.
 
+Feature version 2: every monetary feature is normalized by request-level
+context (median bet size, request quantile grids), so the extractor is
+invariant to the absolute bet/stack/pot scale of the data source. The public
+benchmark quotes amounts around tens of bb while live platform hands quote
+around 1 bb; v1's fixed grids saturated on live data, v2 self-calibrates per
+request. Training builds the same context per date batch, mirroring serving
+where the validator sends the whole eval window in one request.
+
 Used by both the training pipeline and the production miner — keep pure
 stdlib + numpy and tolerant of missing/malformed fields.
 """
@@ -12,11 +20,14 @@ stdlib + numpy and tolerant of missing/malformed fields.
 from __future__ import annotations
 
 from collections import Counter
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 
-# Visible bet-size buckets used by the validator payload canonicalizer.
+FEATURE_VERSION = 2
+
+# Fallback bet-size grid (v1 canonicalizer buckets), used only when a request
+# carries too few positive amounts to build a quantile grid.
 _BUCKETS = np.array(
     [0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 36.0, 56.0, 84.0, 126.0]
 )
@@ -24,6 +35,9 @@ _VISIBLE_BB = 0.02
 _STREET_ORDER = {"preflop": 0, "flop": 1, "turn": 2, "river": 3}
 _ACTION_TYPES = ("fold", "check", "call", "bet", "raise")
 _ACTION_IDX = {t: i for i, t in enumerate(_ACTION_TYPES)}
+_N_HIST_BINS = 15
+_N_SEQ_BUCKETS = 8
+_MIN_CTX_AMOUNTS = 8
 
 
 def _safe_float(value: Any) -> float:
@@ -65,12 +79,9 @@ class _HandView:
         "n_players",
         "hero_seat",
         "stacks",
-        "seq_types",
-        "seq_full",
         "max_street",
         "pot0",
         "pot_last",
-        "single_action_marker",
     )
 
     def __init__(self, hand: Dict[str, Any]):
@@ -87,8 +98,6 @@ class _HandView:
         ]
 
         self.actions = []
-        seq_types: List[str] = []
-        seq_full: List[str] = []
         self.max_street = 0
         for action in actions_raw:
             if not isinstance(action, dict):
@@ -104,13 +113,11 @@ class _HandView:
             pot_before = _safe_float(action.get("pot_before")) / _VISIBLE_BB
             pot_after = _safe_float(action.get("pot_after")) / _VISIBLE_BB
             actor = int(_safe_float(action.get("actor_seat")))
-            bucket = int(np.argmin(np.abs(_BUCKETS - amount_bb))) if amount_bb > 0 else -1
             self.actions.append(
                 {
                     "type": a_type,
                     "street_i": street_i,
                     "amount_bb": amount_bb,
-                    "bucket": bucket,
                     "raise_to": _safe_float(raise_to) if raise_to is not None else None,
                     "call_to": _safe_float(call_to) if call_to is not None else None,
                     "pot_before": pot_before,
@@ -119,32 +126,129 @@ class _HandView:
                 }
             )
             self.max_street = max(self.max_street, street_i)
-            seq_types.append(a_type[0])
-            seq_full.append(f"{street_i}{a_type[0]}{bucket}")
 
-        self.seq_types = "".join(seq_types)
-        self.seq_full = "|".join(seq_full)
         self.pot0 = self.actions[0]["pot_before"] if self.actions else 0.0
         self.pot_last = self.actions[-1]["pot_after"] if self.actions else 0.0
-        # Validator artifact: single-action source hands are emitted as 12
-        # copies of one action.
-        self.single_action_marker = (
-            len(self.actions) >= 10
-            and len({(a["type"], a["street_i"], a["bucket"]) for a in self.actions}) == 1
+
+
+class RequestContext:
+    """Scale calibration shared by every chunk of one request (or one
+    training date batch): bet-size unit, quantile grids, stack unit, and the
+    pooled stack multiset for duplication features."""
+
+    __slots__ = (
+        "amt_scale",
+        "hist_edges",
+        "hist_pool_shares",
+        "hist_pool_entropy",
+        "big_thresholds",
+        "big_pool_shares",
+        "seq_edges",
+        "stack_scale",
+        "stack_counts",
+    )
+
+    def __init__(self, hands: List[_HandView]):
+        amounts = [
+            a["amount_bb"] for h in hands for a in h.actions if a["amount_bb"] > 0
+        ]
+        stacks = [s for h in hands for s in h.stacks]
+        if len(amounts) >= _MIN_CTX_AMOUNTS:
+            arr = np.asarray(amounts, dtype=float)
+            self.amt_scale = float(np.median(arr)) or 1.0
+            self.hist_edges = np.percentile(
+                arr, np.linspace(0.0, 100.0, _N_HIST_BINS + 1)
+            )[1:-1]
+            self.big_thresholds = [float(np.percentile(arr, q)) for q in (60, 80, 90)]
+            self.seq_edges = np.percentile(
+                arr, np.linspace(0.0, 100.0, _N_SEQ_BUCKETS + 1)
+            )[1:-1]
+        else:
+            arr = np.asarray(amounts, dtype=float) if amounts else np.array([])
+            self.amt_scale = 1.0
+            self.hist_edges = _BUCKETS[1:]
+            self.big_thresholds = [24.0, 56.0, 84.0]
+            self.seq_edges = _BUCKETS[::2]
+        # Pool baselines: with heavy ties (live feeds quote few distinct
+        # sizes) equal-mass bins are spiky; features report each chunk's
+        # occupancy anomaly vs these baselines, which is bounded and
+        # 0-centered in every domain.
+        if arr.size:
+            pool_bins = np.searchsorted(self.hist_edges, arr, side="right")
+            counts = np.bincount(pool_bins, minlength=_N_HIST_BINS).astype(float)
+            self.hist_pool_shares = counts / max(1.0, counts.sum())
+            self.hist_pool_entropy = _entropy(self.hist_pool_shares)
+            self.big_pool_shares = [
+                float(np.mean(arr >= t)) for t in self.big_thresholds
+            ]
+        else:
+            self.hist_pool_shares = np.zeros(_N_HIST_BINS)
+            self.hist_pool_entropy = 0.0
+            self.big_pool_shares = [0.0, 0.0, 0.0]
+        med_stack = float(np.median(stacks)) if stacks else 0.0
+        self.stack_scale = med_stack if med_stack > 0 else 1.0
+        self.stack_counts = Counter(stacks)
+
+    def amt_bucket(self, amount: float) -> int:
+        if amount <= 0:
+            return -1
+        return int(np.searchsorted(self.seq_edges, amount, side="right"))
+
+    def hist_bin(self, amount: float) -> int:
+        return int(np.searchsorted(self.hist_edges, amount, side="right"))
+
+
+def compute_request_context(chunks: List[List[Dict[str, Any]]]) -> RequestContext:
+    hands = [
+        _HandView(h)
+        for chunk in chunks
+        if isinstance(chunk, list)
+        for h in chunk
+        if isinstance(h, dict)
+    ]
+    return RequestContext(hands)
+
+
+def _hand_sequences(hand: _HandView, ctx: RequestContext) -> tuple[str, str, bool]:
+    seq_types = "".join(a["type"][0] for a in hand.actions)
+    seq_full = "|".join(
+        f"{a['street_i']}{a['type'][0]}{ctx.amt_bucket(a['amount_bb'])}"
+        for a in hand.actions
+    )
+    # Validator artifact: single-action source hands are emitted as ~12
+    # copies of one action.
+    single_action_marker = (
+        len(hand.actions) >= 10
+        and len(
+            {
+                (a["type"], a["street_i"], round(a["amount_bb"], 6))
+                for a in hand.actions
+            }
         )
+        == 1
+    )
+    return seq_types, seq_full, single_action_marker
 
 
-def extract_chunk_features(chunk: List[Dict[str, Any]]) -> np.ndarray:
-    """Extract one feature vector for a chunk (list of miner-visible hands)."""
+def extract_chunk_features(
+    chunk: List[Dict[str, Any]], ctx: Optional[RequestContext] = None
+) -> np.ndarray:
+    """Extract one feature vector for a chunk (list of miner-visible hands).
+
+    ctx carries the request-level scale calibration; when omitted the chunk
+    self-calibrates (used only by legacy callers/tests)."""
     hands = [_HandView(h) for h in chunk if isinstance(h, dict)]
     hands = [h for h in hands if h.actions or h.n_players]
     features: List[float] = []
     if not hands:
         return np.zeros(len(FEATURE_NAMES), dtype=float)
+    if ctx is None:
+        ctx = RequestContext(hands)
 
     n_hands = len(hands)
     all_actions = [a for h in hands for a in h.actions]
     n_actions = max(1, len(all_actions))
+    unit = ctx.amt_scale
 
     # --- A. action-type rates and volume shape ---------------------------
     type_counts = Counter(a["type"] for a in all_actions)
@@ -174,58 +278,63 @@ def extract_chunk_features(chunk: List[Dict[str, Any]]) -> np.ndarray:
         features.append(sum(1 for m in max_streets if m >= s) / n_hands)
 
     # --- B. sequence repetition (size-unbiased collision statistics) -----
-    seq_counter = Counter(h.seq_types for h in hands)
+    seqs = [_hand_sequences(h, ctx) for h in hands]
+    seq_counter = Counter(s[0] for s in seqs)
     features.append(_collision(list(seq_counter.values()), n_hands))
-    seq_full_counter = Counter(h.seq_full for h in hands)
+    seq_full_counter = Counter(s[1] for s in seqs)
     features.append(_collision(list(seq_full_counter.values()), n_hands))
-    long_seqs = [h.seq_types for h in hands if len(h.actions) >= 6]
+    long_seqs = [s[0] for h, s in zip(hands, seqs) if len(h.actions) >= 6]
     features.append(_collision(list(Counter(long_seqs).values()), len(long_seqs)))
-    combo = [f"{h.n_players}|{h.seq_types}" for h in hands]
+    combo = [f"{h.n_players}|{s[0]}" for h, s in zip(hands, seqs)]
     features.append(_collision(list(Counter(combo).values()), n_hands))
-    features.append(sum(1 for h in hands if h.single_action_marker) / n_hands)
+    features.append(sum(1 for s in seqs if s[2]) / n_hands)
 
-    # --- C. bet-size distribution ----------------------------------------
-    features.extend(_quantiles(amounts, (10, 25, 50, 75, 90)))
+    # --- C. bet-size distribution (request-normalized) --------------------
+    features.extend(v / unit for v in _quantiles(amounts, (10, 25, 50, 75, 90)))
     mean_amt = float(np.mean(amounts)) if amounts else 0.0
-    features.append(mean_amt)
+    features.append(mean_amt / unit)
     features.append(float(np.std(amounts)) / mean_amt if mean_amt > 0 else 0.0)
-    bucket_counts = Counter(a["bucket"] for a in all_actions if a["bucket"] >= 0)
-    n_bucketed = max(1, sum(bucket_counts.values()))
-    bucket_hist = np.array([bucket_counts.get(i, 0) / n_bucketed for i in range(15)])
-    features.extend(bucket_hist.tolist())
-    features.append(_entropy(bucket_hist))
-    for threshold in (24.0, 56.0, 84.0):
-        features.append(
-            sum(1 for v in amounts if v >= threshold) / max(1, len(amounts))
-        )
-    # per-street mean amounts
+    bin_counts = Counter(ctx.hist_bin(v) for v in amounts)
+    n_binned = max(1, sum(bin_counts.values()))
+    hist = np.array([bin_counts.get(i, 0) / n_binned for i in range(_N_HIST_BINS)])
+    features.extend((hist - ctx.hist_pool_shares).tolist())
+    features.append(_entropy(hist) - ctx.hist_pool_entropy)
+    for threshold, pool_share in zip(ctx.big_thresholds, ctx.big_pool_shares):
+        share = sum(1 for v in amounts if v >= threshold) / max(1, len(amounts))
+        features.append(share - pool_share)
+    # per-street mean amounts (request-normalized)
     for s in range(4):
         street_amts = [
             a["amount_bb"] for a in all_actions if a["street_i"] == s and a["amount_bb"] > 0
         ]
-        features.append(float(np.mean(street_amts)) if street_amts else 0.0)
+        features.append(float(np.mean(street_amts)) / unit if street_amts else 0.0)
 
-    # --- D. pot dynamics ---------------------------------------------------
+    # --- D. pot dynamics (request-normalized) -----------------------------
     pot0s = [h.pot0 for h in hands]
-    features.append(float(np.mean(pot0s)))
-    features.append(float(np.std(pot0s)))
-    features.append(_collision(list(Counter(round(p, 2) for p in pot0s).values()), n_hands))
+    features.append(float(np.mean(pot0s)) / unit)
+    features.append(float(np.std(pot0s)) / unit)
+    features.append(
+        _collision(list(Counter(round(p / unit, 2) for p in pot0s).values()), n_hands)
+    )
     pot_growth = [
         (h.pot_last - h.pot0) / max(1, len(h.actions)) for h in hands if h.actions
     ]
-    features.extend(_quantiles(pot_growth, (50, 90)))
+    features.extend(v / unit for v in _quantiles(pot_growth, (50, 90)))
     violations = sum(1 for a in all_actions if a["pot_after"] < a["pot_before"] - 1e-9)
     features.append(violations / n_actions)
 
-    # --- E. stacks ----------------------------------------------------------
+    # --- E. stacks (request-normalized; duplication is scale-free) --------
     stacks = [s for h in hands for s in h.stacks]
-    features.extend(_quantiles(stacks, (10, 50, 90)))
-    features.append(float(np.std(stacks)) if stacks else 0.0)
+    s_unit = ctx.stack_scale
+    features.extend(v / s_unit for v in _quantiles(stacks, (10, 50, 90)))
+    features.append(float(np.std(stacks)) / s_unit if stacks else 0.0)
     features.append(_collision(list(Counter(stacks).values()), len(stacks)))
-    round_stacks = sum(1 for s in stacks if abs(s - round(s / 10.0) * 10.0) < 0.05)
-    features.append(round_stacks / max(1, len(stacks)))
+    dup_stacks = sum(1 for s in stacks if ctx.stack_counts.get(s, 0) >= 2)
+    features.append(dup_stacks / max(1, len(stacks)))
     hand_mean_stacks = [float(np.mean(h.stacks)) for h in hands if h.stacks]
-    features.append(float(np.std(hand_mean_stacks)) if hand_mean_stacks else 0.0)
+    features.append(
+        float(np.std(hand_mean_stacks)) / s_unit if hand_mean_stacks else 0.0
+    )
 
     # --- F. action-type bigrams (within hand) -------------------------------
     bigram = np.zeros((5, 5), dtype=float)
@@ -246,7 +355,7 @@ def extract_chunk_features(chunk: List[Dict[str, Any]]) -> np.ndarray:
     for t in _ACTION_TYPES:
         features.append(hero_counts.get(t, 0) / n_hero)
     hero_amts = [a["amount_bb"] for a in hero_actions if a["amount_bb"] > 0]
-    features.append(float(np.mean(hero_amts)) if hero_amts else 0.0)
+    features.append(float(np.mean(hero_amts)) / unit if hero_amts else 0.0)
 
     return np.asarray(features, dtype=float)
 
@@ -278,12 +387,14 @@ def extract_features_matrix(chunks: List[List[Dict[str, Any]]]) -> np.ndarray:
     """Feature matrix for a full request: absolute + batch-relative blocks.
 
     The validator sends every chunk of the current eval window in a single
-    request, so per-request medians act as an unsupervised drift anchor:
-    the second block is each chunk's offset from the request median.
+    request, so the request doubles as calibration context (bet-size scale,
+    quantile grids) and as an unsupervised drift anchor (the second block is
+    each chunk's offset from the request median).
     """
     if not chunks:
         return np.zeros((0, 2 * len(FEATURE_NAMES)), dtype=float)
-    absolute = np.vstack([extract_chunk_features(chunk) for chunk in chunks])
+    ctx = compute_request_context(chunks)
+    absolute = np.vstack([extract_chunk_features(chunk, ctx) for chunk in chunks])
     if absolute.shape[0] >= 3:
         relative = absolute - np.median(absolute, axis=0)
     else:

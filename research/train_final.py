@@ -24,7 +24,12 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from poker44.detection.features import extract_chunk_features, FEATURE_NAMES  # noqa: E402
+from poker44.detection.features import (  # noqa: E402
+    FEATURE_NAMES,
+    FEATURE_VERSION,
+    compute_request_context,
+    extract_chunk_features,
+)
 
 RESEARCH = Path(__file__).resolve().parent
 MODEL_PATH = REPO_ROOT / "poker44" / "detection" / "model.pkl"
@@ -53,7 +58,13 @@ def main() -> None:
     rng = np.random.default_rng(7)
 
     print(f"extracting features for {len(recs)} groups across {len(dates)} dates...")
-    feats = [extract_chunk_features(r["hands"]) for r in recs]
+    # Request-level calibration context per date batch (mirrors serving,
+    # where the whole eval window arrives in one request).
+    ctx_by_date = {
+        d: compute_request_context([r["hands"] for r in recs if r["date"] == d])
+        for d in dates
+    }
+    feats = [extract_chunk_features(r["hands"], ctx_by_date[r["date"]]) for r in recs]
     A = np.vstack(feats)
     rec_dates = np.array([r["date"] for r in recs])
     date_median = {d: np.median(A[rec_dates == d], axis=0) for d in dates}
@@ -65,10 +76,11 @@ def main() -> None:
     for r in recs:
         hands = r["hands"]
         n = len(hands)
+        ctx = ctx_by_date[r["date"]]
         for _ in range(N_AUG):
             m = int(rng.integers(AUG_MIN, n + 1))
             idx = rng.choice(n, size=m, replace=False)
-            fa = extract_chunk_features([hands[j] for j in idx])
+            fa = extract_chunk_features([hands[j] for j in idx], ctx)
             X_rows.append(np.hstack([fa, fa - date_median[r["date"]]]))
             y_rows.append(r["label"])
 
@@ -89,7 +101,7 @@ def main() -> None:
 
     artifact = {
         "format": "poker44-detection-v1",
-        "feature_version": 1,
+        "feature_version": FEATURE_VERSION,
         "n_features": len(FEATURE_NAMES),
         "gbms": gbms,
         "lr": lr,
@@ -100,7 +112,7 @@ def main() -> None:
 
     meta = {
         "format": "poker44-detection-v1",
-        "feature_version": 1,
+        "feature_version": FEATURE_VERSION,
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "training_dates": [str(d) for d in dates],
         "n_chunk_groups": len(recs),

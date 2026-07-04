@@ -20,7 +20,13 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-from poker44.detection.features import FEATURE_NAMES, extract_chunk_features
+from poker44.detection.features import (
+    FEATURE_NAMES,
+    FEATURE_VERSION,
+    RequestContext,
+    compute_request_context,
+    extract_chunk_features,
+)
 
 MODEL_PATH = Path(__file__).resolve().parent / "model.pkl"
 MODEL_V2_PATH = Path(__file__).resolve().parent / "model_v2.npz"
@@ -147,6 +153,11 @@ class DetectionModel:
         with np.load(path, allow_pickle=False) as npz:
             if str(npz["format"][0]) != "poker44-detection-v2":
                 raise ValueError(f"unexpected artifact format: {npz['format'][0]}")
+            artifact_fv = int(npz["feature_version"][0]) if "feature_version" in npz else 1
+            if artifact_fv != FEATURE_VERSION:
+                raise ValueError(
+                    f"feature version mismatch: artifact={artifact_fv} code={FEATURE_VERSION}"
+                )
             model = _NumpyEnsemble(npz)
         if model.n_features != 2 * len(FEATURE_NAMES):
             raise ValueError(
@@ -162,6 +173,11 @@ class DetectionModel:
             artifact = pickle.load(fh)
         if artifact.get("format") != "poker44-detection-v1":
             raise ValueError(f"unexpected artifact format: {artifact.get('format')}")
+        if int(artifact.get("feature_version", 1)) != FEATURE_VERSION:
+            raise ValueError(
+                f"feature version mismatch: artifact={artifact.get('feature_version', 1)} "
+                f"code={FEATURE_VERSION}"
+            )
         if int(artifact.get("n_features", -1)) != len(FEATURE_NAMES):
             raise ValueError(
                 f"feature count mismatch: artifact={artifact.get('n_features')} "
@@ -210,7 +226,8 @@ class DetectionModel:
         if not self.ready:
             return [self._heuristic_chunk(chunk) for chunk in chunks]
 
-        absolute = np.vstack([self._safe_features(chunk) for chunk in chunks])
+        ctx = compute_request_context(chunks)
+        absolute = np.vstack([self._safe_features(chunk, ctx) for chunk in chunks])
         if absolute.shape[0] >= 3:
             relative = absolute - np.median(absolute, axis=0)
         else:
@@ -231,10 +248,10 @@ class DetectionModel:
         return scores
 
     @staticmethod
-    def _safe_features(chunk: Any) -> np.ndarray:
+    def _safe_features(chunk: Any, ctx: Optional[RequestContext] = None) -> np.ndarray:
         try:
             if isinstance(chunk, list):
-                return extract_chunk_features(chunk)
+                return extract_chunk_features(chunk, ctx)
         except Exception:  # noqa: BLE001
             pass
         return np.zeros(len(FEATURE_NAMES), dtype=float)

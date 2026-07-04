@@ -17,7 +17,11 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from poker44.detection.features import FEATURE_NAMES, extract_chunk_features  # noqa: E402
+from poker44.detection.features import (  # noqa: E402
+    FEATURE_NAMES,
+    FEATURE_VERSION,
+    extract_features_matrix,
+)
 
 PKL_PATH = REPO_ROOT / "poker44" / "detection" / "model.pkl"
 NPZ_PATH = REPO_ROOT / "poker44" / "detection" / "model_v2.npz"
@@ -32,8 +36,15 @@ def export(pkl_path: Path = PKL_PATH, npz_path: Path = NPZ_PATH) -> None:
     lr_pipeline = artifact["lr"]
     lr_weight = float(artifact.get("lr_weight", 0.15))
 
+    artifact_fv = int(artifact.get("feature_version", 1))
+    if artifact_fv != FEATURE_VERSION:
+        raise ValueError(
+            f"model.pkl feature_version={artifact_fv} does not match "
+            f"features.FEATURE_VERSION={FEATURE_VERSION}; retrain first"
+        )
     payload: dict[str, np.ndarray] = {
         "format": np.array(["poker44-detection-v2"]),
+        "feature_version": np.array([FEATURE_VERSION], dtype=np.int64),
         "n_gbms": np.array([len(gbms)], dtype=np.int64),
         "n_features": np.array([2 * len(FEATURE_NAMES)], dtype=np.int64),
         "lr_weight": np.array([lr_weight], dtype=np.float64),
@@ -101,9 +112,7 @@ def verify_parity() -> None:
     max_diff = 0.0
     for date in dates:
         recs = [r for r in records if r["date"] == date]
-        absolute = np.vstack([extract_chunk_features(r["hands"]) for r in recs])
-        relative = absolute - np.median(absolute, axis=0)
-        X = np.hstack([absolute, relative])
+        X = extract_features_matrix([r["hands"] for r in recs])
         p_sk = np.mean([m.predict_proba(X)[:, 1] for m in gbms], axis=0)
         p_sk = (1.0 - lr_weight) * p_sk + lr_weight * lr.predict_proba(X)[:, 1]
         p_np = numpy_model.predict_proba_1(X)
