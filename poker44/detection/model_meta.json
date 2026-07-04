@@ -1,7 +1,7 @@
 {
   "format": "poker44-detection-v1",
-  "feature_version": 2,
-  "trained_at": "2026-07-04T16:02:09.620508+00:00",
+  "feature_version": 3,
+  "trained_at": "2026-07-04T17:42:02.223653+00:00",
   "training_dates": [
     "2026-05-26",
     "2026-05-27",

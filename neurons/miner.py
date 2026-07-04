@@ -84,7 +84,7 @@ class Miner(BaseMinerNeuron):
             implementation_files=[p for p in model_files if p.exists()],
             defaults={
                 "model_name": "poker44-seqcollision-ensemble",
-                "model_version": "2.1.0",
+                "model_version": "3.0.0",
                 "framework": "numpy (HistGB export, trained with scikit-learn)",
                 "license": "MIT",
                 "repo_url": "https://github.com/Xayaan/poker44-claude",

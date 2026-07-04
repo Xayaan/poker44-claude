@@ -103,12 +103,20 @@ class FeatureExtractionTests(unittest.TestCase):
         a = extract_chunk_features(chunk)
         b = extract_chunk_features(doubled)
         # Collision statistics change when duplicating hands (real dupes),
-        # but rate/quantile features must be identical.
-        collision_idx = {
-            i for i, n in enumerate(FEATURE_NAMES) if n.startswith("coll_") or n == "stack_coll" or n == "pot0_coll"
+        # and drift features measure within-chunk heterogeneity, which exact
+        # duplication artificially symmetrizes (halves become identical) —
+        # a transform no real payload exhibits. Everything else must match.
+        exempt_idx = {
+            i
+            for i, n in enumerate(FEATURE_NAMES)
+            if n.startswith("coll_")
+            or n.startswith("drift_")
+            or n in ("stack_coll", "pot0_coll")
         }
         for i, name in enumerate(FEATURE_NAMES):
-            if i in collision_idx:
+            if i in exempt_idx:
+                if name.startswith("drift_"):
+                    self.assertTrue(np.isfinite(b[i]) and b[i] >= 0.0, name)
                 continue
             self.assertAlmostEqual(a[i], b[i], places=9, msg=name)
 

@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 
-FEATURE_VERSION = 2
+FEATURE_VERSION = 3
 
 # Fallback bet-size grid (v1 canonicalizer buckets), used only when a request
 # carries too few positive amounts to build a quantile grid.
@@ -143,6 +143,16 @@ class RequestContext:
         "hist_pool_entropy",
         "big_thresholds",
         "big_pool_shares",
+        "pool_modal_share",
+        "pool_distinct_ratio",
+        "pool_top3_share",
+        "pool_ts_joint",
+        "pool_h_type",
+        "pool_h_type_street",
+        "pool_h_type_prev",
+        "pool_acts_cv",
+        "pool_perhand_check_std",
+        "pool_perhand_fold_std",
         "seq_edges",
         "stack_scale",
         "stack_counts",
@@ -181,13 +191,64 @@ class RequestContext:
             self.big_pool_shares = [
                 float(np.mean(arr >= t)) for t in self.big_thresholds
             ]
+            amt_counts = Counter(round(v, 6) for v in amounts)
+            top = sorted(amt_counts.values(), reverse=True)
+            self.pool_modal_share = top[0] / len(amounts)
+            self.pool_top3_share = sum(top[:3]) / len(amounts)
+            self.pool_distinct_ratio = len(amt_counts) / len(amounts)
         else:
             self.hist_pool_shares = np.zeros(_N_HIST_BINS)
             self.hist_pool_entropy = 0.0
             self.big_pool_shares = [0.0, 0.0, 0.0]
+            self.pool_modal_share = 0.0
+            self.pool_top3_share = 0.0
+            self.pool_distinct_ratio = 0.0
         med_stack = float(np.median(stacks)) if stacks else 0.0
         self.stack_scale = med_stack if med_stack > 0 else 1.0
         self.stack_counts = Counter(stacks)
+
+        # Pooled regularity baselines for the v3 block: chunk features report
+        # their offset from these, so levels stay comparable across domains
+        # with very different action richness.
+        log5 = float(np.log(5.0))
+        pool_actions = [a for h in hands for a in h.actions]
+        n_pa = max(1, len(pool_actions))
+        ts = np.zeros((5, 4), dtype=float)
+        bigram = np.zeros((5, 5), dtype=float)
+        n_bg = 0
+        acts_ph: List[int] = []
+        ph_check: List[float] = []
+        ph_fold: List[float] = []
+        for h in hands:
+            if h.actions:
+                acts_ph.append(len(h.actions))
+                n_a = len(h.actions)
+                ph_check.append(sum(1 for a in h.actions if a["type"] == "check") / n_a)
+                ph_fold.append(sum(1 for a in h.actions if a["type"] == "fold") / n_a)
+            for a in h.actions:
+                ts[_ACTION_IDX[a["type"]], a["street_i"]] += 1.0
+            for prev, cur in zip(h.actions, h.actions[1:]):
+                bigram[_ACTION_IDX[prev["type"]], _ACTION_IDX[cur["type"]]] += 1.0
+                n_bg += 1
+        self.pool_ts_joint = ts / n_pa
+        self.pool_h_type = _entropy(self.pool_ts_joint.sum(axis=1)) / log5
+        self.pool_h_type_street = (
+            _entropy(self.pool_ts_joint.ravel())
+            - _entropy(self.pool_ts_joint.sum(axis=0))
+        ) / log5
+        if n_bg:
+            bigram /= n_bg
+            self.pool_h_type_prev = (
+                _entropy(bigram.ravel()) - _entropy(bigram.sum(axis=1))
+            ) / log5
+        else:
+            self.pool_h_type_prev = 0.0
+        acts_mean = float(np.mean(acts_ph)) if acts_ph else 0.0
+        self.pool_acts_cv = (
+            float(np.std(acts_ph)) / max(1.0, acts_mean) if acts_ph else 0.0
+        )
+        self.pool_perhand_check_std = float(np.std(ph_check)) if ph_check else 0.0
+        self.pool_perhand_fold_std = float(np.std(ph_fold)) if ph_fold else 0.0
 
     def amt_bucket(self, amount: float) -> int:
         if amount <= 0:
@@ -357,6 +418,93 @@ def extract_chunk_features(
     hero_amts = [a["amount_bb"] for a in hero_actions if a["amount_bb"] > 0]
     features.append(float(np.mean(hero_amts)) / unit if hero_amts else 0.0)
 
+    # --- H. regularity block (v3): signals that generalize to real bots ------
+    # Bots — synthetic or live — are more deterministic and more
+    # self-consistent than humans. All of this is scale-free and defined in
+    # every domain (unlike exact-sequence collisions, which die when the
+    # action space is rich).
+
+    # H1. action-type x street joint rates, as anomaly vs the request pool
+    ts_counts = np.zeros((5, 4), dtype=float)
+    for a in all_actions:
+        ts_counts[_ACTION_IDX[a["type"]], a["street_i"]] += 1.0
+    ts_joint = ts_counts / n_actions
+    features.extend((ts_joint - ctx.pool_ts_joint).ravel().tolist())
+
+    # H2. determinism: entropies as offsets from the request pool (levels are
+    # domain-dependent; offsets are comparable everywhere)
+    log5 = float(np.log(5.0))
+    p_type = ts_joint.sum(axis=1)
+    features.append(_entropy(p_type) / log5 - ctx.pool_h_type)
+    p_street = ts_joint.sum(axis=0)
+    h_cond_street = (_entropy(ts_joint.ravel()) - _entropy(p_street)) / log5
+    features.append(h_cond_street - ctx.pool_h_type_street)
+    if n_bigrams:
+        p_prev = bigram.sum(axis=1)
+        h_cond_prev = (_entropy(bigram.ravel()) - _entropy(p_prev)) / log5
+    else:
+        h_cond_prev = 0.0
+    features.append(h_cond_prev - ctx.pool_h_type_prev)
+
+    # H3. within-chunk behavioral drift (humans drift, bots stay put)
+    def _type_rates(sub: List[_HandView]) -> np.ndarray:
+        cnt = np.zeros(5, dtype=float)
+        for h in sub:
+            for a in h.actions:
+                cnt[_ACTION_IDX[a["type"]]] += 1.0
+        return cnt / max(1.0, cnt.sum())
+
+    def _street_shares(sub: List[_HandView]) -> np.ndarray:
+        cnt = np.zeros(4, dtype=float)
+        for h in sub:
+            for a in h.actions:
+                cnt[a["street_i"]] += 1.0
+        return cnt / max(1.0, cnt.sum())
+
+    # sampling noise scales ~1/sqrt(n); rescale so 30-hand training chunks
+    # and 90-hand live chunks land in the same range
+    half = n_hands // 2
+    root_n = float(np.sqrt(n_hands))
+    first, second = hands[:half], hands[half:]
+    features.append(root_n * float(np.abs(_type_rates(first) - _type_rates(second)).sum()))
+    features.append(root_n * float(np.abs(_street_shares(first) - _street_shares(second)).sum()))
+    features.append(root_n * float(np.abs(_type_rates(hands[::2]) - _type_rates(hands[1::2])).sum()))
+    acts_mean = float(np.mean(acts_per_hand)) if acts_per_hand else 0.0
+    m1 = float(np.mean([len(h.actions) for h in first])) if first else 0.0
+    m2 = float(np.mean([len(h.actions) for h in second])) if second else 0.0
+    features.append(root_n * abs(m1 - m2) / max(1.0, acts_mean))
+
+    # H4. sizing-formula adherence: modal amount concentration vs the pool
+    if amounts:
+        amt_counts = Counter(round(v, 6) for v in amounts)
+        top = sorted(amt_counts.values(), reverse=True)
+        modal_share = top[0] / len(amounts)
+        top3_share = sum(top[:3]) / len(amounts)
+        distinct_ratio = len(amt_counts) / len(amounts)
+    else:
+        modal_share = top3_share = distinct_ratio = 0.0
+    features.append(modal_share - ctx.pool_modal_share)
+    features.append(top3_share - ctx.pool_top3_share)
+    features.append(distinct_ratio - ctx.pool_distinct_ratio)
+
+    # H5. volume regularity + per-hand rate dispersion (pool-anchored)
+    features.append(
+        float(np.std(acts_per_hand)) / max(1.0, acts_mean) - ctx.pool_acts_cv
+    )
+    ph_check, ph_fold = [], []
+    for h in hands:
+        if not h.actions:
+            continue
+        n_a = len(h.actions)
+        ph_check.append(sum(1 for a in h.actions if a["type"] == "check") / n_a)
+        ph_fold.append(sum(1 for a in h.actions if a["type"] == "fold") / n_a)
+    features.append(
+        (float(np.std(ph_check)) if ph_check else 0.0) - ctx.pool_perhand_check_std
+    )
+    features.append(
+        (float(np.std(ph_fold)) if ph_fold else 0.0) - ctx.pool_perhand_fold_std
+    )
+
     return np.asarray(features, dtype=float)
 
 
@@ -377,6 +525,11 @@ def _build_feature_names() -> List[str]:
     names += ["stack_p10", "stack_p50", "stack_p90", "stack_std", "stack_coll", "stack_round_share", "stack_hand_drift"]
     names += [f"bg_{a}_{b}" for a in _ACTION_TYPES for b in _ACTION_TYPES]
     names += ["hero_action_share"] + [f"hero_rate_{t}" for t in _ACTION_TYPES] + ["hero_amt_mean"]
+    names += [f"ts_{t}_{s}" for t in _ACTION_TYPES for s in range(4)]
+    names += ["H_type", "H_type_given_street", "H_type_given_prev"]
+    names += ["drift_type_half", "drift_street_half", "drift_type_oddeven", "drift_acts_half"]
+    names += ["amt_modal_anom", "amt_top3_share", "amt_distinct_anom"]
+    names += ["acts_cv", "perhand_check_std", "perhand_fold_std"]
     return names
 
 
