@@ -8,6 +8,9 @@ artifact cannot be loaded, so responses are never dropped.
 
 # from __future__ import annotations
 
+import gzip
+import json
+import os
 import time
 from collections import Counter
 from pathlib import Path
@@ -54,6 +57,17 @@ class Miner(BaseMinerNeuron):
             f"Detector self-check | engine={check['engine']} ready={check['ready']} "
             f"scores={check['scores']} load_error={check['load_error']}"
         )
+        # Diagnostics-only payload capture (never used for training; see
+        # manifest private_data_attestation). Rotating, size-capped, optional.
+        self._capture_dir: Path | None = None
+        if os.getenv("POKER44_CAPTURE", "1") != "0":
+            try:
+                cap = Path(os.getenv("POKER44_CAPTURE_DIR", str(repo_root / "captures")))
+                cap.mkdir(parents=True, exist_ok=True)
+                self._capture_dir = cap
+            except Exception as exc:  # noqa: BLE001
+                bt.logging.warning(f"Capture dir unavailable ({exc}); capture disabled.")
+        self._capture_keep = max(1, int(os.getenv("POKER44_CAPTURE_KEEP", "8")))
         model_files = [
             Path(__file__).resolve(),
             repo_root / "poker44" / "detection" / "features.py",
@@ -155,7 +169,70 @@ class Miner(BaseMinerNeuron):
             f"engine={self.detector.engine if self.detector.ready else 'heuristic fallback'} "
             f"scores[{stats}]"
         )
+        try:
+            bt.logging.info(f"Payload fingerprint | {self._fingerprint(chunks)}")
+            self._capture_request(chunks, scores)
+        except Exception as exc:  # noqa: BLE001 - diagnostics must never hurt scoring
+            bt.logging.warning(f"Diagnostics failed (ignored): {exc}")
         return synapse
+
+    @staticmethod
+    def _fingerprint(chunks: list) -> str:
+        """Compact structural summary of a request, safe on any payload."""
+        hand_counts, action_counts = [], []
+        amount_present = 0
+        hands_seen = 0
+        action_types: Counter = Counter()
+        first_keys: list[str] = []
+        for chunk in chunks:
+            if not isinstance(chunk, list):
+                continue
+            hand_counts.append(len(chunk))
+            for hand in chunk:
+                if not isinstance(hand, dict):
+                    continue
+                hands_seen += 1
+                if not first_keys:
+                    first_keys = sorted(hand.keys())[:12]
+                actions = hand.get("actions") or []
+                if isinstance(actions, list):
+                    action_counts.append(len(actions))
+                    for a in actions:
+                        if isinstance(a, dict):
+                            action_types[str(a.get("action_type"))] += 1
+                            amt = a.get("normalized_amount_bb")
+                            if isinstance(amt, (int, float)) and amt > 0:
+                                amount_present += 1
+        def _q(vals: list, q: float) -> float:
+            if not vals:
+                return 0.0
+            s = sorted(vals)
+            return float(s[min(len(s) - 1, int(q * len(s)))])
+        total_actions = max(1, sum(action_types.values()))
+        top_actions = ",".join(f"{k}:{v * 100 // total_actions}%" for k, v in action_types.most_common(5))
+        return (
+            f"chunks={len(chunks)} hands/chunk[p10={_q(hand_counts, 0.1):.0f} "
+            f"med={_q(hand_counts, 0.5):.0f} p90={_q(hand_counts, 0.9):.0f}] "
+            f"actions/hand[med={_q(action_counts, 0.5):.0f} p90={_q(action_counts, 0.9):.0f}] "
+            f"amt>0={amount_present * 100 // max(1, sum(action_counts) or 1)}% "
+            f"action_types[{top_actions}] hand_keys={first_keys}"
+        )
+
+    def _capture_request(self, chunks: list, scores: list) -> None:
+        """Rotating gzip dump of the raw request for offline diagnostics."""
+        if self._capture_dir is None:
+            return
+        ts = int(time.time())
+        path = self._capture_dir / f"req_{ts}.json.gz"
+        payload = {"ts": ts, "n_chunks": len(chunks), "scores": scores, "chunks": chunks}
+        with gzip.open(path, "wt", encoding="utf-8") as fh:
+            json.dump(payload, fh, separators=(",", ":"), default=str)
+        old = sorted(self._capture_dir.glob("req_*.json.gz"))
+        for stale in old[: max(0, len(old) - self._capture_keep)]:
+            try:
+                stale.unlink()
+            except OSError:
+                pass
 
     @staticmethod
     def _clamp01(value: float) -> float:
