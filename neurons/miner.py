@@ -73,6 +73,12 @@ class Miner(BaseMinerNeuron):
             repo_root / "poker44" / "detection" / "features.py",
             repo_root / "poker44" / "detection" / "model.py",
         ]
+        artifact_path = repo_root / "poker44" / "detection" / "model_v2.npz"
+        artifact_sha256 = ""
+        if artifact_path.exists():
+            import hashlib
+
+            artifact_sha256 = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
         self.model_manifest = build_local_model_manifest(
             repo_root=repo_root,
             implementation_files=[p for p in model_files if p.exists()],
@@ -90,6 +96,11 @@ class Miner(BaseMinerNeuron):
                 ),
                 "open_source": True,
                 "inference_mode": "local",
+                "artifact_url": (
+                    "https://github.com/Xayaan/poker44-claude/raw/main/"
+                    "poker44/detection/model_v2.npz"
+                ),
+                "artifact_sha256": artifact_sha256,
                 "training_data_statement": (
                     "Trained exclusively on the public Poker44 training benchmark "
                     "(api.poker44.net/api/v1/benchmark), all release dates, "

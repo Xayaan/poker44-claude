@@ -30,10 +30,27 @@ def _parse_bool(value: str | None, *, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def _sha256_for_files(paths: Iterable[Path]) -> str:
+def _sha256_for_files(paths: Iterable[Path], *, base_dir: Optional[Path] = None) -> str:
+    """Digest over (path label + content) per file.
+
+    With base_dir the label is the repo-relative POSIX path, so the digest is
+    reproducible by anyone from a checkout of the published repo/commit:
+    sha256(rel_path_1 + bytes_1 + rel_path_2 + bytes_2 + ...) with files
+    sorted by label.
+    """
+    labeled: List[tuple[str, Path]] = []
+    for path in (p.resolve() for p in paths):
+        label = str(path)
+        if base_dir is not None:
+            try:
+                label = path.relative_to(base_dir.resolve()).as_posix()
+            except ValueError:
+                label = path.name
+        labeled.append((label, path))
+
     digest = hashlib.sha256()
-    for path in sorted((p.resolve() for p in paths), key=lambda p: str(p)):
-        digest.update(str(path).encode("utf-8"))
+    for label, path in sorted(labeled, key=lambda item: item[0]):
+        digest.update(label.encode("utf-8"))
         with path.open("rb") as handle:
             while True:
                 chunk = handle.read(1024 * 1024)
@@ -66,7 +83,7 @@ def build_local_model_manifest(
 ) -> Dict[str, Any]:
     """Build a serializable manifest for the miner's current implementation."""
     implementation_paths = [path.resolve() for path in implementation_files]
-    implementation_sha256 = _sha256_for_files(implementation_paths)
+    implementation_sha256 = _sha256_for_files(implementation_paths, base_dir=repo_root)
     default_values = dict(defaults or {})
     repo_commit = os.getenv(
         "POKER44_MODEL_REPO_COMMIT",

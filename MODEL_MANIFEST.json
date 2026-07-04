@@ -1,0 +1,29 @@
+{
+  "artifact_sha256": "fa34ceda9364190f665d472068fe45573e17f3b0dc09ed395c11db5be8efb32a",
+  "artifact_url": "https://github.com/Xayaan/poker44-claude/raw/main/poker44/detection/model_v2.npz",
+  "framework": "numpy (HistGB export, trained with scikit-learn)",
+  "implementation_files": [
+    "neurons/miner.py",
+    "poker44/detection/features.py",
+    "poker44/detection/model.py"
+  ],
+  "implementation_sha256": "a6fd8cdab64632361a93f200100638d74d04065ae06547d01540df882a02033e",
+  "inference_mode": "local",
+  "license": "MIT",
+  "model_name": "poker44-seqcollision-ensemble",
+  "model_version": "2.0.0",
+  "notes": "HistGradientBoosting ensemble + logistic blend over chunk-size-invariant behavioral features (sequence-collision U-statistics, bet-size histograms, pot/stack dynamics, action bigrams) with batch-relative drift anchoring. Inference is numpy-native (model_v2.npz).",
+  "open_source": true,
+  "private_data_attestation": "This miner does not train on validator-only evaluation data.",
+  "repo_url": "https://github.com/Xayaan/poker44-claude",
+  "schema_version": "1",
+  "training_data_sources": [
+    "https://api.poker44.net/api/v1/benchmark"
+  ],
+  "training_data_statement": "Trained exclusively on the public Poker44 training benchmark (api.poker44.net/api/v1/benchmark), all release dates, projected through the validator payload canonicalizer.",
+  "verification": {
+    "artifact_sha256_recipe": "sha256 of poker44/detection/model_v2.npz bytes",
+    "implementation_sha256_recipe": "sha256 over files sorted by repo-relative POSIX path, updating for each file: utf-8 bytes of the relative path, then the raw file bytes. Files: neurons/miner.py, poker44/detection/features.py, poker44/detection/model.py",
+    "repo_commit_note": "repo_commit reported in-band equals `git rev-parse HEAD` of the serving checkout of this repository."
+  }
+}
