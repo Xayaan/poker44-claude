@@ -25,6 +25,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from poker44.detection.features import (  # noqa: E402
+    ACTIVE_FULL_IDX,
     FEATURE_NAMES,
     FEATURE_VERSION,
     compute_request_context,
@@ -84,7 +85,7 @@ def main() -> None:
             X_rows.append(np.hstack([fa, fa - date_median[r["date"]]]))
             y_rows.append(r["label"])
 
-    X = np.vstack(X_rows)
+    X = np.vstack(X_rows)[:, ACTIVE_FULL_IDX]  # drop live-degenerate columns
     y = np.array(y_rows)
     print(f"training matrix: {X.shape}")
 
@@ -103,6 +104,7 @@ def main() -> None:
         "format": "poker44-detection-v1",
         "feature_version": FEATURE_VERSION,
         "n_features": len(FEATURE_NAMES),
+        "active_full_idx": [int(i) for i in ACTIVE_FULL_IDX],
         "gbms": gbms,
         "lr": lr,
         "lr_weight": LR_WEIGHT,

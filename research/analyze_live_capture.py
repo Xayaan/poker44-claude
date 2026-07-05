@@ -135,8 +135,9 @@ def benchmark_compare(X_live: np.ndarray) -> None:
     m = DetectionModel()
     rel_b = X_b - np.median(X_b, axis=0)
     rel_l = X_live - np.median(X_live, axis=0)
-    p_b = m._predict_proba(np.hstack([X_b, rel_b]))
-    p_l = m._predict_proba(np.hstack([X_live, rel_l]))
+    idx = m._active_full_idx
+    p_b = m._predict_proba(np.hstack([X_b, rel_b])[:, idx])
+    p_l = m._predict_proba(np.hstack([X_live, rel_l])[:, idx])
     print(f"\nmodel scores | benchmark(recent): frac[0.4,0.6]={float(np.mean((p_b >= .4) & (p_b <= .6))):.2f} "
           f"| live: frac[0.4,0.6]={float(np.mean((p_l >= .4) & (p_l <= .6))):.2f}")
     print(f"benchmark score split: hum_med={float(np.median(p_b[y_b == 0])):.3f} bot_med={float(np.median(p_b[y_b == 1])):.3f}")

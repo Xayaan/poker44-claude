@@ -535,6 +535,40 @@ def _build_feature_names() -> List[str]:
 
 FEATURE_NAMES: List[str] = _build_feature_names()
 
+# Features whose variance collapses on live validator traffic (measured on
+# unlabeled captured payloads, 2026-07-04: live MAD < 2% of benchmark MAD).
+# They stay in the extractor for auditability but are excluded from model
+# input, so training cannot lean on signals that are flat in production.
+# Derived purely from feature variance on unlabeled data — no label
+# information can leak (see manifest notes).
+LIVE_DEGENERATE_FEATURES: List[str] = [
+    "acts_p10",
+    "acts_p50",
+    "acts_p90",
+    "single_action_rate",
+    "amt_p10",
+    "amt_p25",
+    "amt_p50",
+    "amt_p75",
+    "stack_std",
+    "stack_coll",
+    "stack_round_share",
+    "stack_hand_drift",
+    "bg_bet_bet",
+    "bg_raise_bet",
+    "bg_raise_raise",
+    "ts_bet_0",
+    "ts_raise_3",
+]
+_DEAD_SET = set(LIVE_DEGENERATE_FEATURES)
+ACTIVE_IDX: np.ndarray = np.array(
+    [i for i, n in enumerate(FEATURE_NAMES) if n not in _DEAD_SET], dtype=np.int64
+)
+# absolute block + batch-relative block share the mask
+ACTIVE_FULL_IDX: np.ndarray = np.concatenate(
+    [ACTIVE_IDX, ACTIVE_IDX + len(FEATURE_NAMES)]
+)
+
 
 def extract_features_matrix(chunks: List[List[Dict[str, Any]]]) -> np.ndarray:
     """Feature matrix for a full request: absolute + batch-relative blocks.

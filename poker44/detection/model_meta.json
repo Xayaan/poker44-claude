@@ -1,7 +1,7 @@
 {
   "format": "poker44-detection-v1",
   "feature_version": 3,
-  "trained_at": "2026-07-04T17:42:02.223653+00:00",
+  "trained_at": "2026-07-05T14:29:30.271975+00:00",
   "training_dates": [
     "2026-05-26",
     "2026-05-27",
@@ -41,10 +41,12 @@
     "2026-06-30",
     "2026-07-01",
     "2026-07-02",
-    "2026-07-03"
+    "2026-07-03",
+    "2026-07-04",
+    "2026-07-05"
   ],
-  "n_chunk_groups": 556,
-  "n_training_rows": 5004,
+  "n_chunk_groups": 582,
+  "n_training_rows": 5238,
   "lodo_pooled_reward": 0.859,
   "lodo_pooled_ap": 0.916,
   "lodo_per_date_reward_min": 0.657,

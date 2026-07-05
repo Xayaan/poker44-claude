@@ -1,5 +1,5 @@
 {
-  "artifact_sha256": "62d0654408470c7d484e6cbc30165cc549f93d3ebdc333a489a429ed79833cf8",
+  "artifact_sha256": "19339abfe60d30aedf6c68f809cbbe134a66760a9e006680dc1e8bcd8df61eaf",
   "artifact_url": "https://github.com/Xayaan/poker44-claude/raw/main/poker44/detection/model_v2.npz",
   "framework": "numpy (HistGB export, trained with scikit-learn)",
   "implementation_files": [
@@ -7,14 +7,14 @@
     "poker44/detection/features.py",
     "poker44/detection/model.py"
   ],
-  "implementation_sha256": "e704597d629ce3c608b029dd2a960b675e46b36cbb148787c8e819ae2193e012",
+  "implementation_sha256": "dc451994f65d994ee66a3ca5a282d4e6f77c8660af5ac09b75f0876a77849928",
   "inference_mode": "local",
   "license": "MIT",
   "model_name": "poker44-seqcollision-ensemble",
-  "model_version": "3.0.0",
-  "notes": "Feature v3: request-calibrated scale-free features plus pool-anchored regularity block (action-type-by-street anomalies, conditional-entropy offsets, within-chunk behavioral drift, sizing-formula adherence) so signals generalize across data domains. Numpy-native inference (model_v2.npz).",
+  "model_version": "3.1.0",
+  "notes": "Feature v3.1: request-calibrated scale-free features, pool-anchored regularity block, and a live-degeneracy feature mask (LIVE_DEGENERATE_FEATURES in features.py) so training cannot rely on signals that are constant in production. Numpy-native inference (model_v2.npz).",
   "open_source": true,
-  "private_data_attestation": "This miner does not train on validator-only evaluation data.",
+  "private_data_attestation": "This miner does not train on validator-only evaluation data. Feature selection excludes columns whose variance collapses on live traffic, measured on unlabeled captured payloads only (no labels exist in captures; no label information can leak).",
   "repo_url": "https://github.com/Xayaan/poker44-claude",
   "schema_version": "1",
   "training_data_sources": [

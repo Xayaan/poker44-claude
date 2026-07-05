@@ -125,6 +125,9 @@ class DetectionModel:
         self._lock = threading.Lock()
         self._numpy_model: Optional[_NumpyEnsemble] = None
         self._artifact: Optional[Dict[str, Any]] = None
+        self._active_full_idx: np.ndarray = np.arange(
+            2 * len(FEATURE_NAMES), dtype=np.int64
+        )
         self._load_error: Optional[str] = None
         self._engine = "heuristic"
         self._load()
@@ -158,12 +161,20 @@ class DetectionModel:
                 raise ValueError(
                     f"feature version mismatch: artifact={artifact_fv} code={FEATURE_VERSION}"
                 )
+            active_idx = (
+                npz["active_full_idx"].astype(np.int64)
+                if "active_full_idx" in npz
+                else np.arange(2 * len(FEATURE_NAMES), dtype=np.int64)
+            )
             model = _NumpyEnsemble(npz)
-        if model.n_features != 2 * len(FEATURE_NAMES):
+        if active_idx.size and int(active_idx.max()) >= 2 * len(FEATURE_NAMES):
+            raise ValueError("active_full_idx out of range for extracted features")
+        if model.n_features != int(active_idx.size):
             raise ValueError(
                 f"feature count mismatch: artifact={model.n_features} "
-                f"code={2 * len(FEATURE_NAMES)}"
+                f"active={int(active_idx.size)}"
             )
+        self._active_full_idx = active_idx
         self._numpy_model = model
 
     def _load_pickle(self, path: Path) -> None:
@@ -183,6 +194,12 @@ class DetectionModel:
                 f"feature count mismatch: artifact={artifact.get('n_features')} "
                 f"code={len(FEATURE_NAMES)}"
             )
+        idx = artifact.get("active_full_idx")
+        self._active_full_idx = (
+            np.asarray(idx, dtype=np.int64)
+            if idx is not None
+            else np.arange(2 * len(FEATURE_NAMES), dtype=np.int64)
+        )
         self._artifact = artifact
 
     @property
@@ -232,7 +249,7 @@ class DetectionModel:
             relative = absolute - np.median(absolute, axis=0)
         else:
             relative = np.zeros_like(absolute)
-        X = np.hstack([absolute, relative])
+        X = np.hstack([absolute, relative])[:, self._active_full_idx]
 
         proba = self._predict_proba(X)
 

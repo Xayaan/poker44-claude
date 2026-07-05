@@ -42,11 +42,16 @@ def export(pkl_path: Path = PKL_PATH, npz_path: Path = NPZ_PATH) -> None:
             f"model.pkl feature_version={artifact_fv} does not match "
             f"features.FEATURE_VERSION={FEATURE_VERSION}; retrain first"
         )
+    active_idx = np.asarray(
+        artifact.get("active_full_idx", list(range(2 * len(FEATURE_NAMES)))),
+        dtype=np.int64,
+    )
     payload: dict[str, np.ndarray] = {
         "format": np.array(["poker44-detection-v2"]),
         "feature_version": np.array([FEATURE_VERSION], dtype=np.int64),
+        "active_full_idx": active_idx,
         "n_gbms": np.array([len(gbms)], dtype=np.int64),
-        "n_features": np.array([2 * len(FEATURE_NAMES)], dtype=np.int64),
+        "n_features": np.array([int(active_idx.size)], dtype=np.int64),
         "lr_weight": np.array([lr_weight], dtype=np.float64),
     }
 
@@ -107,12 +112,16 @@ def verify_parity() -> None:
     with np.load(NPZ_PATH, allow_pickle=False) as npz:
         numpy_model = _NumpyEnsemble(npz)
 
+    active_idx = np.asarray(
+        artifact.get("active_full_idx", list(range(2 * len(FEATURE_NAMES)))),
+        dtype=np.int64,
+    )
     records = pickle.load(open(DATASET, "rb"))
     dates = sorted({r["date"] for r in records})
     max_diff = 0.0
     for date in dates:
         recs = [r for r in records if r["date"] == date]
-        X = extract_features_matrix([r["hands"] for r in recs])
+        X = extract_features_matrix([r["hands"] for r in recs])[:, active_idx]
         p_sk = np.mean([m.predict_proba(X)[:, 1] for m in gbms], axis=0)
         p_sk = (1.0 - lr_weight) * p_sk + lr_weight * lr.predict_proba(X)[:, 1]
         p_np = numpy_model.predict_proba_1(X)
