@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
-# Daily retrain with a safety gate. Intended for cron on the deploy host,
-# shortly after the benchmark release drops (00:05 UTC):
+# Nightly retrain with a safety gate and manifest consistency guarantee.
+# Cron (deploy host), shortly after the benchmark release drops (00:05 UTC):
 #   5 1 * * * cd /root/poker44-claude && bash scripts/miner/retrain_daily.sh >> retrain.log 2>&1
 #
-# Flow: download new releases -> rebuild dataset -> GATE (train without the
-# newest date, require reward >= GATE_MIN on it) -> full retrain + numpy
-# export (parity-checked) -> verify artifact loads -> restart miner.
-# On any failure the previous artifact keeps serving.
+# Consistency invariant: the miner only ever serves artifacts that exist at a
+# PUBLISHED commit of the manifest repo. Flow:
+#   sync to origin/main (auto-deploys code updates)
+#   -> download new releases -> rebuild dataset
+#   -> GATE: train without the newest date, require reward >= GATE_MIN on it
+#   -> full retrain + numpy export (sklearn/numpy parity asserted)
+#   -> refresh MODEL_MANIFEST.json artifact hash
+#   -> commit artifacts and PUSH; only then restart the miner
+# If the gate, training, or push fails: artifacts revert to HEAD and the
+# previous (consistent) model keeps serving.
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
@@ -16,6 +22,10 @@ PM2_NAME="${PM2_NAME:-poker44_miner}"
 GATE_MIN="${GATE_MIN:-0.60}"
 
 echo "=== $(date -u +%FT%TZ) retrain_daily start (py=$PY) ==="
+
+git fetch origin
+git reset --hard origin/main
+echo "base commit: $(git rev-parse --short HEAD)"
 
 "$PY" research/download_benchmark.py
 "$PY" research/build_dataset.py
@@ -56,13 +66,26 @@ sys.exit(0 if rew >= float("${GATE_MIN}") else 1)
 PYEOF
 echo "gate passed"
 
-# --- full retrain + numpy export (includes sklearn/numpy parity assert) ---
-"$PY" research/train_final.py
+revert_artifacts() {
+    echo "reverting artifacts to committed state ($(git rev-parse --short HEAD))"
+    git checkout -- poker44/detection/ MODEL_MANIFEST.json 2>/dev/null || true
+}
 
-# --- verify the artifact the miner will load ------------------------------
+# --- full retrain + numpy export (includes sklearn/numpy parity assert) ---
+if ! "$PY" research/train_final.py; then
+    revert_artifacts
+    echo "TRAIN FAILED; previous model keeps serving"
+    exit 1
+fi
+
+# --- refresh manifest artifact hash + verify the artifact loads -----------
 "$PY" - <<'PYEOF'
-import sys
+import hashlib, json, sys
+from pathlib import Path
 sys.path.insert(0, ".")
+mf = json.loads(Path("MODEL_MANIFEST.json").read_text())
+mf["artifact_sha256"] = hashlib.sha256(Path("poker44/detection/model_v2.npz").read_bytes()).hexdigest()
+Path("MODEL_MANIFEST.json").write_text(json.dumps(mf, indent=2, sort_keys=True) + "\n")
 from poker44.detection.model import DetectionModel
 m = DetectionModel()
 assert m.engine == "numpy-v2" and m.ready, (m.engine, m.load_error)
@@ -71,7 +94,25 @@ assert check["scores"] is not None
 print("artifact ok:", check)
 PYEOF
 
+# --- publish: served model must equal a public commit ----------------------
+git add poker44/detection/model.pkl poker44/detection/model_v2.npz \
+        poker44/detection/model_meta.json MODEL_MANIFEST.json
+if git diff --cached --quiet; then
+    echo "no artifact changes; nothing to publish"
+else
+    git -c user.name="poker44-miner" -c user.email="miner@leadpoet" \
+        commit -q -m "Nightly retrain: $(date -u +%F) benchmark releases"
+    if ! git push --no-verify origin main; then
+        echo "push rejected; re-syncing and retrying once"
+        NEW_HEAD="$(git rev-parse HEAD)"
+        git fetch origin && git reset --hard origin/main
+        git cherry-pick "$NEW_HEAD" || { git cherry-pick --abort || true; revert_artifacts; echo "PUSH FAILED; previous model keeps serving"; exit 1; }
+        git push --no-verify origin main || { git reset --hard origin/main; echo "PUSH FAILED; previous model keeps serving"; exit 1; }
+    fi
+    echo "published commit: $(git rev-parse --short HEAD)"
+fi
+
 pm2 restart "$PM2_NAME" && pm2 save
 sleep 8
-grep -hE "Detector self-check" ~/.pm2/logs/*out*.log 2>/dev/null | tail -1 || true
+grep -hE "Detector self-check|Manifest summary" ~/.pm2/logs/*out*.log 2>/dev/null | tail -2 || true
 echo "=== $(date -u +%FT%TZ) retrain_daily done ==="
