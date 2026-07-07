@@ -28,6 +28,7 @@ from poker44.detection.features import (  # noqa: E402
     ACTIVE_FULL_IDX,
     FEATURE_NAMES,
     FEATURE_VERSION,
+    LIVE_DEGENERATE_FEATURES,
     compute_request_context,
     extract_chunk_features,
 )
@@ -119,10 +120,14 @@ def main() -> None:
         "training_dates": [str(d) for d in dates],
         "n_chunk_groups": len(recs),
         "n_training_rows": int(X.shape[0]),
-        "lodo_pooled_reward": 0.859,
-        "lodo_pooled_ap": 0.916,
-        "lodo_per_date_reward_min": 0.657,
-        "lodo_per_date_reward_median": 0.895,
+        "n_features_active": int(X.shape[1]),
+        "live_degenerate_masked": len(LIVE_DEGENERATE_FEATURES),
+        "validation_note": (
+            "Validated by temporal holdout in research/ (not computed inline). "
+            "v3.1 masked model: pooled ~0.80 reward on unseen benchmark dates. "
+            "Live reward is lower (benchmark->live domain gap); see "
+            "research/ENGINEERING_LOG.md."
+        ),
         "data_source": "https://api.poker44.net/api/v1/benchmark (public training benchmark)",
     }
     META_PATH.write_text(json.dumps(meta, indent=2))

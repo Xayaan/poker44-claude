@@ -48,9 +48,8 @@
   ],
   "n_chunk_groups": 724,
   "n_training_rows": 6516,
-  "lodo_pooled_reward": 0.859,
-  "lodo_pooled_ap": 0.916,
-  "lodo_per_date_reward_min": 0.657,
-  "lodo_per_date_reward_median": 0.895,
-  "data_source": "https://api.poker44.net/api/v1/benchmark (public training benchmark)"
+  "data_source": "https://api.poker44.net/api/v1/benchmark (public training benchmark)",
+  "n_features_active": 244,
+  "live_degenerate_masked": 17,
+  "validation_note": "Validated by temporal holdout in research/ (not computed inline). v3.1 masked model: pooled ~0.80 reward on unseen benchmark dates. Live reward is lower (benchmark->live domain gap); see research/ENGINEERING_LOG.md."
 }
