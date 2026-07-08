@@ -84,15 +84,18 @@ class Miner(BaseMinerNeuron):
             implementation_files=[p for p in model_files if p.exists()],
             defaults={
                 "model_name": "poker44-seqcollision-ensemble",
-                "model_version": "3.1.0",
+                "model_version": "4.0.0",
                 "framework": "numpy (HistGB export, trained with scikit-learn)",
                 "license": "MIT",
                 "repo_url": "https://github.com/Xayaan/poker44-claude",
                 "notes": (
                     "HistGradientBoosting ensemble + logistic blend over "
-                    "chunk-size-invariant behavioral features (sequence-collision "
-                    "U-statistics, bet-size histograms, pot/stack dynamics, action "
-                    "bigrams) with batch-relative drift anchoring."
+                    "chunk-size-invariant, request-calibrated behavioral features "
+                    "(pool-anchored regularity, denoised sizing-lattice, streets "
+                    "reach, position profile, conditional determinism) with "
+                    "batch-relative drift anchoring, live-regime domain "
+                    "randomization at train time and deterministic sub-chunk TTA "
+                    "at serve time."
                 ),
                 "open_source": True,
                 "inference_mode": "local",
@@ -104,7 +107,13 @@ class Miner(BaseMinerNeuron):
                 "training_data_statement": (
                     "Trained exclusively on the public Poker44 training benchmark "
                     "(api.poker44.net/api/v1/benchmark), all release dates, "
-                    "projected through the validator payload canonicalizer."
+                    "projected through the validator payload canonicalizer. Each "
+                    "group additionally trains in a live-regime augmentation view "
+                    "(research/live_mimic.py): an order-preserving bucket remap of "
+                    "the same benchmark hands whose target marginals are aggregate, "
+                    "unlabeled statistics of captured evaluation payloads (as with "
+                    "the live-degeneracy feature mask). No evaluation payload or "
+                    "label enters training data."
                 ),
                 "training_data_sources": [
                     "https://api.poker44.net/api/v1/benchmark",

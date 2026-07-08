@@ -1,5 +1,5 @@
 {
-  "artifact_sha256": "4ba1e9f2a9fed67059916697c4cccd9574f1f28a3b9c938a8b07eea8eaac4a2e",
+  "artifact_sha256": "c2e9cce42d6f545577951e58ba7a1bd699eb564ef34937d0ac32cdbd7d118b6f",
   "artifact_url": "https://github.com/Xayaan/poker44-claude/raw/main/poker44/detection/model_v2.npz",
   "framework": "numpy (HistGB export, trained with scikit-learn)",
   "implementation_files": [
@@ -7,20 +7,20 @@
     "poker44/detection/features.py",
     "poker44/detection/model.py"
   ],
-  "implementation_sha256": "dc451994f65d994ee66a3ca5a282d4e6f77c8660af5ac09b75f0876a77849928",
+  "implementation_sha256": "348b2b3c9b444e1c98b900f8cb8d525c2f80640b3d4a061d8b8a560f61248b07",
   "inference_mode": "local",
   "license": "MIT",
   "model_name": "poker44-seqcollision-ensemble",
-  "model_version": "3.1.0",
-  "notes": "Feature v3.1: request-calibrated scale-free features, pool-anchored regularity block, and a live-degeneracy feature mask (LIVE_DEGENERATE_FEATURES in features.py) so training cannot rely on signals that are constant in production. Numpy-native inference (model_v2.npz).",
+  "model_version": "4.0.0",
+  "notes": "Feature v4: request-calibrated scale-free features, pool-anchored regularity block, denoised sizing-lattice / streets-reach / position / conditional-determinism blocks (all verified non-degenerate on live traffic), live-degeneracy feature mask (LIVE_DEGENERATE_FEATURES in features.py), live-regime domain randomization at train time (research/live_mimic.py), deterministic sub-chunk TTA at serve time, 12-model HistGB ensemble + logistic blend. Numpy-native inference (model_v2.npz).",
   "open_source": true,
-  "private_data_attestation": "This miner does not train on validator-only evaluation data. Feature selection excludes columns whose variance collapses on live traffic, measured on unlabeled captured payloads only (no labels exist in captures; no label information can leak).",
+  "private_data_attestation": "This miner does not train on validator-only evaluation data. Feature selection excludes columns whose variance collapses on live traffic, and the domain-randomization targets are aggregate marginal statistics, both measured on unlabeled captured payloads only (no labels exist in captures; no label information can leak).",
   "repo_url": "https://github.com/Xayaan/poker44-claude",
   "schema_version": "1",
   "training_data_sources": [
     "https://api.poker44.net/api/v1/benchmark"
   ],
-  "training_data_statement": "Trained exclusively on the public Poker44 training benchmark (api.poker44.net/api/v1/benchmark), all release dates, projected through the validator payload canonicalizer.",
+  "training_data_statement": "Trained exclusively on the public Poker44 training benchmark (api.poker44.net/api/v1/benchmark), all release dates, projected through the validator payload canonicalizer. Each group additionally trains in a live-regime augmentation view (research/live_mimic.py): an order-preserving bucket remap of the same benchmark hands whose target marginals are aggregate, unlabeled statistics of captured evaluation payloads (as with the live-degeneracy feature mask). No evaluation payload or label enters training data.",
   "verification": {
     "artifact_sha256_recipe": "sha256 of poker44/detection/model_v2.npz bytes",
     "implementation_sha256_recipe": "sha256 over files sorted by repo-relative POSIX path, updating for each file: utf-8 bytes of the relative path, then the raw file bytes. Files: neurons/miner.py, poker44/detection/features.py, poker44/detection/model.py",

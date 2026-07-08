@@ -1,7 +1,7 @@
 {
   "format": "poker44-detection-v1",
-  "feature_version": 3,
-  "trained_at": "2026-07-06T18:51:10.283165+00:00",
+  "feature_version": 4,
+  "trained_at": "2026-07-08T07:16:26.297525+00:00",
   "training_dates": [
     "2026-05-26",
     "2026-05-27",
@@ -44,12 +44,14 @@
     "2026-07-03",
     "2026-07-04",
     "2026-07-05",
-    "2026-07-06"
+    "2026-07-06",
+    "2026-07-07"
   ],
-  "n_chunk_groups": 724,
-  "n_training_rows": 6516,
-  "data_source": "https://api.poker44.net/api/v1/benchmark (public training benchmark)",
-  "n_features_active": 244,
-  "live_degenerate_masked": 17,
-  "validation_note": "Validated by temporal holdout in research/ (not computed inline). v3.1 masked model: pooled ~0.80 reward on unseen benchmark dates. Live reward is lower (benchmark->live domain gap); see research/ENGINEERING_LOG.md."
+  "n_chunk_groups": 886,
+  "n_training_rows": 15948,
+  "n_features_active": 282,
+  "live_degenerate_masked": 19,
+  "domain_randomization": "each group trains in two views: original benchmark and the live-regime transform (research/live_mimic.py; transform targets are aggregate unlabeled capture statistics \u2014 no validator payload enters training data)",
+  "validation_note": "Validated by temporal holdout in research/ (not computed inline). v4 model: per-date mean ~0.86 (original view) / ~0.84 (live-mimic view) on 11 unseen benchmark dates with serving-side TTA. Live reward is lower (benchmark->live population gap); see research/ENGINEERING_LOG.md.",
+  "data_source": "https://api.poker44.net/api/v1/benchmark (public training benchmark)"
 }

@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 
-FEATURE_VERSION = 3
+FEATURE_VERSION = 4
 
 # Fallback bet-size grid (v1 canonicalizer buckets), used only when a request
 # carries too few positive amounts to build a quantile grid.
@@ -71,6 +71,22 @@ def _entropy(probs: np.ndarray) -> float:
     return float(-np.sum(p * np.log(p)))
 
 
+def _entropy_counts(counts) -> float:
+    tot = float(sum(counts))
+    if tot <= 0:
+        return 0.0
+    p = np.asarray([c for c in counts if c > 0], dtype=float) / tot
+    return float(-np.sum(p * np.log(p)))
+
+
+def _lattice_idx(value_bb: float) -> int:
+    """Index of the nearest platform obfuscation bucket. The validator's
+    payload projection snaps every monetary value to this lattice plus
+    bounded deterministic noise, so the nearest bucket recovers the TRUE
+    quantized value in every domain (verified 100% on live captures)."""
+    return int(np.argmin(np.abs(_BUCKETS - value_bb)))
+
+
 class _HandView:
     """Pre-parsed single hand."""
 
@@ -82,12 +98,15 @@ class _HandView:
         "max_street",
         "pot0",
         "pot_last",
+        "streets_len",
     )
 
     def __init__(self, hand: Dict[str, Any]):
         metadata = hand.get("metadata") if isinstance(hand.get("metadata"), dict) else {}
         players = hand.get("players") if isinstance(hand.get("players"), list) else []
         actions_raw = hand.get("actions") if isinstance(hand.get("actions"), list) else []
+        streets = hand.get("streets") if isinstance(hand.get("streets"), list) else []
+        self.streets_len = len(streets)
 
         self.hero_seat = int(_safe_float(metadata.get("hero_seat")))
         self.n_players = len(players)
@@ -156,6 +175,22 @@ class RequestContext:
         "seq_edges",
         "stack_scale",
         "stack_counts",
+        "dn_rank_buckets",
+        "dn_topk_shares",
+        "dn_modal",
+        "dn_distinct",
+        "dn_h_bucket",
+        "dn_h_bucket_street",
+        "dn_single_share",
+        "dn_h_pot_trans",
+        "sa_shares",
+        "sa_mean",
+        "sa_entropy",
+        "pos_hero_shares",
+        "pos_h_hero",
+        "cd_h_type_facing",
+        "cd_agg_facing",
+        "cd_h_tri",
     )
 
     def __init__(self, hands: List[_HandView]):
@@ -249,6 +284,102 @@ class RequestContext:
         )
         self.pool_perhand_check_std = float(np.std(ph_check)) if ph_check else 0.0
         self.pool_perhand_fold_std = float(np.std(ph_fold)) if ph_fold else 0.0
+
+        # v4 pool baselines: denoised-lattice sizing, streets-array reach,
+        # hero-position profile, conditional determinism. Chunk features
+        # report offsets from these (levels are domain-dependent).
+        log4 = float(np.log(4.0))
+        log15 = float(np.log(15.0))
+        amt_b: List[int] = []
+        st_amt_b: List[tuple] = []
+        single_flags: List[float] = []
+        street_len_c: Counter = Counter()
+        hero_c: Counter = Counter()
+        facing_ctx: Counter = Counter()
+        facing_tot: Counter = Counter()
+        trigram: Counter = Counter()
+        trigram_prev: Counter = Counter()
+        potpair: List[tuple] = []
+        n_v4_hands = 0
+        for h in hands:
+            if not (h.actions or h.streets_len):
+                continue
+            n_v4_hands += 1
+            street_len_c[min(h.streets_len, 4)] += 1
+            hero_c[min(h.hero_seat, 3) if h.hero_seat >= 1 else 0] += 1
+            hb = [
+                _lattice_idx(a["amount_bb"]) for a in h.actions if a["amount_bb"] > 0
+            ]
+            amt_b.extend(hb)
+            st_amt_b.extend(
+                (a["street_i"], _lattice_idx(a["amount_bb"]))
+                for a in h.actions
+                if a["amount_bb"] > 0
+            )
+            if len(hb) >= 2:
+                single_flags.append(1.0 if len(set(hb)) == 1 else 0.0)
+            seen_pos = set()
+            for a in h.actions:
+                facing = 1 if a["street_i"] in seen_pos else 0
+                facing_ctx[(a["street_i"], facing, a["type"])] += 1
+                facing_tot[(a["street_i"], facing)] += 1
+                if a["amount_bb"] > 0:
+                    seen_pos.add(a["street_i"])
+                if a["pot_before"] > 0 and a["pot_after"] > 0:
+                    potpair.append(
+                        (_lattice_idx(a["pot_before"]), _lattice_idx(a["pot_after"]))
+                    )
+            for p2, p1, cur in zip(h.actions, h.actions[1:], h.actions[2:]):
+                trigram[(p2["type"], p1["type"], cur["type"])] += 1
+                trigram_prev[(p2["type"], p1["type"])] += 1
+        n_v4_hands = max(1, n_v4_hands)
+        cnt = Counter(amt_b)
+        ranked = [b for b, _ in cnt.most_common()]
+        self.dn_rank_buckets = (ranked + [-99, -99])[:2]
+        tot_amt = max(1, len(amt_b))
+        self.dn_topk_shares = [
+            cnt.get(b, 0) / tot_amt for b in self.dn_rank_buckets
+        ]
+        top = sorted(cnt.values(), reverse=True)
+        self.dn_modal = top[0] / tot_amt if top else 0.0
+        self.dn_distinct = len(cnt) / tot_amt if top else 0.0
+        self.dn_h_bucket = _entropy_counts(cnt.values()) / log15
+        st_tot = Counter(s for s, _ in st_amt_b)
+        h_bs = 0.0
+        for s, n_s in st_tot.items():
+            sub = Counter(b for ss, b in st_amt_b if ss == s)
+            h_bs += (n_s / tot_amt) * _entropy_counts(sub.values())
+        self.dn_h_bucket_street = h_bs / log15
+        self.dn_single_share = float(np.mean(single_flags)) if single_flags else 0.0
+        pair_c = Counter(potpair)
+        prev_c = Counter(p[0] for p in potpair)
+        self.dn_h_pot_trans = (
+            _entropy_counts(pair_c.values()) - _entropy_counts(prev_c.values())
+        ) / log15
+        self.sa_shares = [street_len_c.get(k, 0) / n_v4_hands for k in range(5)]
+        self.sa_mean = (
+            sum(k * v for k, v in street_len_c.items()) / n_v4_hands
+        )
+        self.sa_entropy = _entropy_counts(street_len_c.values()) / log5
+        htot = max(1, sum(hero_c.values()))
+        self.pos_hero_shares = [hero_c.get(k, 0) / htot for k in (1, 2, 3)]
+        self.pos_h_hero = _entropy_counts(hero_c.values()) / log4
+        ftot = max(1, sum(facing_tot.values()))
+        h_f = 0.0
+        for key, n_k in facing_tot.items():
+            sub = [facing_ctx[(key[0], key[1], t)] for t in _ACTION_TYPES]
+            h_f += (n_k / ftot) * _entropy_counts(sub)
+        self.cd_h_type_facing = h_f / log5
+        agg = sum(
+            v
+            for (s, f, t), v in facing_ctx.items()
+            if f == 1 and t in ("bet", "raise")
+        )
+        ftot1 = max(1, sum(v for (s, f), v in facing_tot.items() if f == 1))
+        self.cd_agg_facing = agg / ftot1
+        self.cd_h_tri = (
+            _entropy_counts(trigram.values()) - _entropy_counts(trigram_prev.values())
+        ) / log5
 
     def amt_bucket(self, amount: float) -> int:
         if amount <= 0:
@@ -505,6 +636,100 @@ def extract_chunk_features(
         (float(np.std(ph_fold)) if ph_fold else 0.0) - ctx.pool_perhand_fold_std
     )
 
+    # --- I. v4 block: signals proven ALIVE on live traffic -------------------
+    # Denoised sizing lattice (the projection's bucket+noise obfuscation is
+    # invertible — snap to the true bucket), streets-array true reach, hero
+    # position profile, conditional determinism. All pool-anchored offsets.
+    log4 = float(np.log(4.0))
+    log15 = float(np.log(15.0))
+    v4_hands = [h for h in hands if h.actions or h.streets_len]
+    amt_b: List[int] = []
+    st_amt_b: List[tuple] = []
+    single_flags: List[float] = []
+    street_len_c: Counter = Counter()
+    hero_c: Counter = Counter()
+    facing_ctx: Counter = Counter()
+    facing_tot: Counter = Counter()
+    trigram: Counter = Counter()
+    trigram_prev: Counter = Counter()
+    potpair: List[tuple] = []
+    for h in v4_hands:
+        street_len_c[min(h.streets_len, 4)] += 1
+        hero_c[min(h.hero_seat, 3) if h.hero_seat >= 1 else 0] += 1
+        hb = [_lattice_idx(a["amount_bb"]) for a in h.actions if a["amount_bb"] > 0]
+        amt_b.extend(hb)
+        st_amt_b.extend(
+            (a["street_i"], _lattice_idx(a["amount_bb"]))
+            for a in h.actions
+            if a["amount_bb"] > 0
+        )
+        if len(hb) >= 2:
+            single_flags.append(1.0 if len(set(hb)) == 1 else 0.0)
+        seen_pos = set()
+        for a in h.actions:
+            facing = 1 if a["street_i"] in seen_pos else 0
+            facing_ctx[(a["street_i"], facing, a["type"])] += 1
+            facing_tot[(a["street_i"], facing)] += 1
+            if a["amount_bb"] > 0:
+                seen_pos.add(a["street_i"])
+            if a["pot_before"] > 0 and a["pot_after"] > 0:
+                potpair.append(
+                    (_lattice_idx(a["pot_before"]), _lattice_idx(a["pot_after"]))
+                )
+        for p2, p1, cur in zip(h.actions, h.actions[1:], h.actions[2:]):
+            trigram[(p2["type"], p1["type"], cur["type"])] += 1
+            trigram_prev[(p2["type"], p1["type"])] += 1
+    n_v4 = max(1, len(v4_hands))
+    cnt = Counter(amt_b)
+    tot_amt = max(1, len(amt_b))
+    for b, pool_share in zip(ctx.dn_rank_buckets, ctx.dn_topk_shares):
+        features.append(cnt.get(b, 0) / tot_amt - pool_share)
+    top = sorted(cnt.values(), reverse=True)
+    features.append((top[0] / tot_amt if top else 0.0) - ctx.dn_modal)
+    features.append((len(cnt) / tot_amt if top else 0.0) - ctx.dn_distinct)
+    features.append(_entropy_counts(cnt.values()) / log15 - ctx.dn_h_bucket)
+    st_tot = Counter(s for s, _ in st_amt_b)
+    h_bs = 0.0
+    for s, n_s in st_tot.items():
+        sub = Counter(b for ss, b in st_amt_b if ss == s)
+        h_bs += (n_s / tot_amt) * _entropy_counts(sub.values())
+    features.append(h_bs / log15 - ctx.dn_h_bucket_street)
+    features.append(
+        (float(np.mean(single_flags)) if single_flags else 0.0) - ctx.dn_single_share
+    )
+    pair_c = Counter(potpair)
+    prev_c = Counter(p[0] for p in potpair)
+    features.append(
+        (_entropy_counts(pair_c.values()) - _entropy_counts(prev_c.values())) / log15
+        - ctx.dn_h_pot_trans
+    )
+    for j in range(4):
+        features.append(street_len_c.get(j, 0) / n_v4 - ctx.sa_shares[j])
+    features.append(
+        sum(k * v for k, v in street_len_c.items()) / n_v4 - ctx.sa_mean
+    )
+    features.append(_entropy_counts(street_len_c.values()) / log5 - ctx.sa_entropy)
+    htot = max(1, sum(hero_c.values()))
+    for i, seat in enumerate((1, 2, 3)):
+        features.append(hero_c.get(seat, 0) / htot - ctx.pos_hero_shares[i])
+    features.append(_entropy_counts(hero_c.values()) / log4 - ctx.pos_h_hero)
+    ftot = max(1, sum(facing_tot.values()))
+    h_f = 0.0
+    for key, n_k in facing_tot.items():
+        sub = [facing_ctx[(key[0], key[1], t)] for t in _ACTION_TYPES]
+        h_f += (n_k / ftot) * _entropy_counts(sub)
+    features.append(h_f / log5 - ctx.cd_h_type_facing)
+    agg = sum(
+        v for (s, f, t), v in facing_ctx.items() if f == 1 and t in ("bet", "raise")
+    )
+    ftot1 = max(1, sum(v for (s, f), v in facing_tot.items() if f == 1))
+    features.append(agg / ftot1 - ctx.cd_agg_facing)
+    features.append(
+        (_entropy_counts(trigram.values()) - _entropy_counts(trigram_prev.values()))
+        / log5
+        - ctx.cd_h_tri
+    )
+
     return np.asarray(features, dtype=float)
 
 
@@ -530,6 +755,12 @@ def _build_feature_names() -> List[str]:
     names += ["drift_type_half", "drift_street_half", "drift_type_oddeven", "drift_acts_half"]
     names += ["amt_modal_anom", "amt_top3_share", "amt_distinct_anom"]
     names += ["acts_cv", "perhand_check_std", "perhand_fold_std"]
+    # v4 block
+    names += ["dn_top1_share", "dn_top2_share", "dn_modal", "dn_distinct"]
+    names += ["dn_H_bucket", "dn_H_bucket_street", "dn_single_bucket_share", "dn_H_pot_trans"]
+    names += [f"sa_len_{k}" for k in range(4)] + ["sa_mean", "sa_entropy"]
+    names += ["pos_hero1", "pos_hero2", "pos_hero3", "pos_H_hero"]
+    names += ["cd_H_type_facing", "cd_agg_facing", "cd_H_tri"]
     return names
 
 
@@ -559,6 +790,11 @@ LIVE_DEGENERATE_FEATURES: List[str] = [
     "bg_raise_raise",
     "ts_bet_0",
     "ts_raise_3",
+    # mask v2 (2026-07-08 audit of the same capture): exact-sequence
+    # collision with amount buckets and the unit-pinned stack median are
+    # also variance-collapsed live (live MAD < 5% of benchmark MAD).
+    "coll_seq_full",
+    "stack_p50",
 ]
 _DEAD_SET = set(LIVE_DEGENERATE_FEATURES)
 ACTIVE_IDX: np.ndarray = np.array(

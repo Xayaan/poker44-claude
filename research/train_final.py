@@ -1,14 +1,19 @@
 """Train the final Poker44 detection ensemble on ALL release dates and export
-the production artifact to poker44/detection/model.pkl.
+the production artifact to poker44/detection/model.pkl (+ model_v2.npz).
 
-Recipe (selected by leave-one-date-out CV, see research/train.py):
-  features : poker44.detection.features (abs + batch-relative), v1
-  aug      : 8 random sub-chunks per group (18..n hands)
+Recipe (v4, validated on temporal holdout 2026-07-08 — see
+research/ENGINEERING_LOG.md §9):
+  features : poker44.detection.features v4 (abs + batch-relative, 141 active)
+  views    : domain randomization — every group trains twice: original view
+             and live-mimic view (research/live_mimic.py), each with its own
+             per-(date,view) request context and batch median
+  aug      : 8 random sub-chunks per group per view (18..n hands)
   ensemble : HistGB {(300,d3,lr.06,15), (300,d4,lr.06,31), (500,d3,lr.04,15)}
-             x seeds {0, 1}  ->  mean proba, blended 0.85/0.15 with
+             x seeds {0,1,2,3}  ->  mean proba, blended 0.85/0.15 with
              StandardScaler+LogisticRegression(C=0.2)
-LODO metrics of this recipe: pooled reward 0.859 (AP 0.916), per-date
-median 0.895, min 0.657, 38/38 dates >= 0.65.
+Temporal holdout (train <=06-26, test 11 later dates, per-date reward):
+  original view mean 0.858, live-mimic view mean 0.841 (with serving TTA);
+  baseline v3.1 recipe was 0.847 / 0.812.
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from poker44.detection.features import (  # noqa: E402
     ACTIVE_FULL_IDX,
@@ -32,6 +38,7 @@ from poker44.detection.features import (  # noqa: E402
     compute_request_context,
     extract_chunk_features,
 )
+from live_mimic import build_mimic_records  # noqa: E402
 
 RESEARCH = Path(__file__).resolve().parent
 MODEL_PATH = REPO_ROOT / "poker44" / "detection" / "model.pkl"
@@ -42,26 +49,17 @@ GBM_CONFIGS = [
     dict(max_iter=300, max_depth=4, learning_rate=0.06, l2_regularization=1.0, max_leaf_nodes=31),
     dict(max_iter=500, max_depth=3, learning_rate=0.04, l2_regularization=1.0, max_leaf_nodes=15),
 ]
-SEEDS = (0, 1)
+SEEDS = (0, 1, 2, 3)
 LR_WEIGHT = 0.15
 N_AUG = 8
 AUG_MIN = 18
 
 
-def main() -> None:
-    from sklearn.ensemble import HistGradientBoostingClassifier
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.pipeline import make_pipeline
-    from sklearn.preprocessing import StandardScaler
-
-    with open(RESEARCH / "dataset.pkl", "rb") as fh:
-        recs = pickle.load(fh)
+def _view_rows(recs: list[dict], view: str, rng: np.random.Generator):
+    """Feature rows (abs + batch-relative) for one view of the dataset:
+    per-date request context + per-date batch median, originals + N_AUG
+    sub-chunk augmentations per group."""
     dates = sorted({r["date"] for r in recs})
-    rng = np.random.default_rng(7)
-
-    print(f"extracting features for {len(recs)} groups across {len(dates)} dates...")
-    # Request-level calibration context per date batch (mirrors serving,
-    # where the whole eval window arrives in one request).
     ctx_by_date = {
         d: compute_request_context([r["hands"] for r in recs if r["date"] == d])
         for d in dates
@@ -80,11 +78,32 @@ def main() -> None:
         n = len(hands)
         ctx = ctx_by_date[r["date"]]
         for _ in range(N_AUG):
-            m = int(rng.integers(AUG_MIN, n + 1))
+            m = int(rng.integers(min(AUG_MIN, n), n + 1))
             idx = rng.choice(n, size=m, replace=False)
             fa = extract_chunk_features([hands[j] for j in idx], ctx)
             X_rows.append(np.hstack([fa, fa - date_median[r["date"]]]))
             y_rows.append(r["label"])
+    print(f"  view={view}: {len(X_rows)} rows")
+    return X_rows, y_rows
+
+
+def main() -> None:
+    from sklearn.ensemble import HistGradientBoostingClassifier
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    with open(RESEARCH / "dataset.pkl", "rb") as fh:
+        recs = pickle.load(fh)
+    dates = sorted({r["date"] for r in recs})
+    rng = np.random.default_rng(7)
+
+    print(f"extracting features for {len(recs)} groups across {len(dates)} dates (2 views)...")
+    X_rows, y_rows = _view_rows(recs, "original", rng)
+    mimic = build_mimic_records(recs)
+    xr_m, yr_m = _view_rows(mimic, "live-mimic", rng)
+    X_rows += xr_m
+    y_rows += yr_m
 
     X = np.vstack(X_rows)[:, ACTIVE_FULL_IDX]  # drop live-degenerate columns
     y = np.array(y_rows)
@@ -122,10 +141,17 @@ def main() -> None:
         "n_training_rows": int(X.shape[0]),
         "n_features_active": int(X.shape[1]),
         "live_degenerate_masked": len(LIVE_DEGENERATE_FEATURES),
+        "domain_randomization": (
+            "each group trains in two views: original benchmark and the "
+            "live-regime transform (research/live_mimic.py; transform targets "
+            "are aggregate unlabeled capture statistics — no validator payload "
+            "enters training data)"
+        ),
         "validation_note": (
             "Validated by temporal holdout in research/ (not computed inline). "
-            "v3.1 masked model: pooled ~0.80 reward on unseen benchmark dates. "
-            "Live reward is lower (benchmark->live domain gap); see "
+            "v4 model: per-date mean ~0.86 (original view) / ~0.84 (live-mimic "
+            "view) on 11 unseen benchmark dates with serving-side TTA. Live "
+            "reward is lower (benchmark->live population gap); see "
             "research/ENGINEERING_LOG.md."
         ),
         "data_source": "https://api.poker44.net/api/v1/benchmark (public training benchmark)",

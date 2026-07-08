@@ -31,6 +31,13 @@ from poker44.detection.features import (
 MODEL_PATH = Path(__file__).resolve().parent / "model.pkl"
 MODEL_V2_PATH = Path(__file__).resolve().parent / "model_v2.npz"
 _NEUTRAL_SCORE = 0.5
+# Test-time augmentation: average scores over deterministic sub-chunk views.
+# The reward is a pure ranking metric; averaging views reduces per-chunk score
+# variance and lifted the per-window reward minimum on temporal holdout
+# (research/ENGINEERING_LOG.md §9). Deterministic seed -> reproducible scores.
+_TTA_VIEWS = 3
+_TTA_MIN_HANDS = 19
+_TTA_SEED = 1789
 
 
 class _NumpyEnsemble:
@@ -239,19 +246,38 @@ class DetectionModel:
                 return (1.0 - lr_weight) * proba + lr_weight * lr.predict_proba(X)[:, 1]
         raise RuntimeError("no artifact loaded")
 
+    def _view_proba(self, rows: np.ndarray) -> np.ndarray:
+        if rows.shape[0] >= 3:
+            relative = rows - np.median(rows, axis=0)
+        else:
+            relative = np.zeros_like(rows)
+        X = np.hstack([rows, relative])[:, self._active_full_idx]
+        return self._predict_proba(X)
+
     def _score_chunks_model(self, chunks: List[List[dict]]) -> List[float]:
         if not self.ready:
             return [self._heuristic_chunk(chunk) for chunk in chunks]
 
         ctx = compute_request_context(chunks)
         absolute = np.vstack([self._safe_features(chunk, ctx) for chunk in chunks])
-        if absolute.shape[0] >= 3:
-            relative = absolute - np.median(absolute, axis=0)
-        else:
-            relative = np.zeros_like(absolute)
-        X = np.hstack([absolute, relative])[:, self._active_full_idx]
+        probas = [self._view_proba(absolute)]
 
-        proba = self._predict_proba(X)
+        # TTA sub-chunk views share the request context (the calibration
+        # anchor is the request, not the subsample).
+        rng = np.random.default_rng(_TTA_SEED)
+        for _ in range(_TTA_VIEWS):
+            rows = []
+            for chunk in chunks:
+                if isinstance(chunk, list) and len(chunk) >= _TTA_MIN_HANDS:
+                    n = len(chunk)
+                    m = int(rng.integers(max(18, int(0.7 * n)), n + 1))
+                    idx = rng.choice(n, size=m, replace=False)
+                    sub = [chunk[j] for j in idx]
+                else:
+                    sub = chunk if isinstance(chunk, list) else []
+                rows.append(self._safe_features(sub, ctx))
+            probas.append(self._view_proba(np.vstack(rows)))
+        proba = np.mean(probas, axis=0)
 
         scores: List[float] = []
         for chunk, p in zip(chunks, proba):

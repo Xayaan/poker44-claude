@@ -6,9 +6,10 @@ does, **why each piece exists**, how to operate it, and how every change was
 verified. A companion private operator playbook (VPS access, wallet mapping,
 forward strategy) lives in the maintainer's session memory, not here.
 
-Status as of commit `08958e6` (2026-07-06). **We are not winning yet** — see
-§1. This log is honest about that on purpose; a future maintainer who believes
-the code is "winning" will make bad calls.
+Status as of 2026-07-08 (model 4.0.0, §9). **We are not winning yet** — live
+0.475–0.525 vs leader 0.58+; §9 records what was measured, ruled out, and
+shipped against that gap. This log is honest about that on purpose; a future
+maintainer who believes the code is "winning" will make bad calls.
 
 ---
 
@@ -316,3 +317,97 @@ python research/analyze_live_capture.py 'captures/req_*.json.gz' --benchmark
   shifts in new releases.
 - **Self-probe impossible** — `force_validator_permit` blocks our own hotkey;
   don't build tooling that expects to query the live axon.
+
+---
+
+## 9. 2026-07-08 session — v4: what was measured, ruled out, and shipped
+
+Goal: find the edge vs the 0.58+ leaders. Method: stop guessing what "live"
+means and test each candidate explanation of the transfer gap with labels.
+
+### 9.1 New facts extracted from the capture + validator code
+
+- **The obfuscation lattice is invertible.** `payload_view._coarse_bb_value`
+  snaps every monetary value to the fixed bucket grid (0.5, 1, 1.5, 2, 3, 4,
+  6, 8, …126) plus deterministic sha-seeded noise whose amplitude is small
+  vs bucket spacing. Snapping any visible value to the nearest bucket
+  recovers the TRUE quantized value — verified 100.0% on the live capture
+  and on benchmark. Live "62 distinct bet sizes" = 3 true buckets
+  {1.0: 79%, 1.5: 20%, 2.0: 1%} × noise contexts; live pots live on
+  {3, 4, 6, 8} bb.
+- **Live has structure the features ignored**: `streets` arrays (true street
+  reach, 0–3 entries live) vary per chunk; hero/actor alias seats vary
+  (tables 6–9 max); the 4 capture files are ONE window (validators re-send).
+- Two more active features are variance-dead live (`coll_seq_full`,
+  `stack_p50`) → mask v2 (19 masked of 160).
+
+### 9.2 Hypotheses tested with labels (each could have been "the gap")
+
+Built a **live-mimic transform** (`research/live_mimic.py`): order-preserving
+cumulative-mass remap of RAW benchmark hands onto the live lattices + live
+table-size mix + streets cap, re-projected through the real
+`prepare_hand_for_miner`. Marginals match the capture closely (amounts
+77/23 vs live 79/20; pots/seats aligned). This gives a **labeled pseudo-live
+holdout** — the first labeled measurement of regime transfer.
+
+| hypothesis | test | result |
+|---|---|---|
+| money/table regime shift breaks features | score orig-trained model on pseudo-live test dates | **ruled out** — 0.847→0.812 only; v2/v3 scale-free design already absorbs the regime |
+| live windows aren't 50/50 like benchmark batches; pool-anchored offsets break | re-batch test dates at bot-share 0.3/0.5/0.65/0.8, serving-parity scoring | **ruled out** — reward flat-to-better with imbalance (0.82/0.85/0.85/0.86) |
+| behavioral population gap (live bots are real, benchmark bots synthetic; whitepaper: live eval comes from Integrity Labs / Hybrid tournaments with human-like-bot incentives) | remaining explanation | **stands** — not fixable from benchmark alone; requires live-side signal accumulation (playbook lever 1) |
+
+### 9.3 What shipped in v4 (each passed the labeled holdouts)
+
+Temporal holdout = train ≤06-26, test on 11 later dates (incl. the two 10×
+releases), per-date reward, evaluated on BOTH views:
+
+| change | orig-view mean | pseudo-live mean | worst per-date min |
+|---|---|---|---|
+| v3.1 baseline | 0.847 | 0.812 | 0.671 |
+| + domain randomization (train on orig + mimic view) | 0.858 | 0.834 | 0.648 |
+| + v4 features + 4 seeds | 0.861 | 0.827 | 0.665 |
+| + serving TTA (**shipped combo**) | **0.858** | **0.841** | **0.687 / 0.724** |
+
+- **Features v4** (160 names; +21): denoised-lattice sizing block (`dn_*` —
+  modal/distinct/entropy on TRUE buckets, sizing-per-street determinism,
+  pot-transition entropy), streets-array reach block (`sa_*`), hero-position
+  profile (`pos_*`), conditional determinism (`cd_*` — action entropy given
+  street×facing, aggression-when-facing, trigram determinism). Every one is
+  a pool-anchored offset and was verified ALIVE on live (MAD ratio ≥ 0.2 vs
+  benchmark). Candidates that failed the live-variance check were cut
+  (complete-hand collision, 4-street share, own-top2/top3 bucket shares).
+- **Domain randomization**: every group trains in two views (original +
+  live-mimic), own per-(date,view) context/medians. Transform targets are
+  aggregate unlabeled capture marginals — disclosed in the manifest like the
+  mask; no evaluation payload/label enters training.
+- **Ensemble**: seeds (0,1) → (0,1,2,3) = 12 GBMs + LR 0.15 (rank-averaging
+  tested: no gain; recency weighting stays rejected).
+- **Serving TTA** (`model.py`): score = mean over the full view + 3
+  deterministic sub-chunk views (70–100% of hands, request-context shared,
+  fixed seed 1789). Ranking metric ⇒ variance reduction lifts the per-window
+  floor: pseudo-live per-date MIN 0.648→0.724. This directly targets
+  round-to-round consistency (composite = mean of rounds).
+- Version 4.0.0; feature-version guards force old artifacts to fallback (by
+  design); manifest statements extended for the DR disclosure.
+
+### 9.4 Ruled out / dead ends this session (don't re-tread)
+
+- Rank-mean ensembling (≈ proba-mean), bench-side new-feature gains without
+  DR (wash), complete-hand exact-collision (live hands never have ≤4 visible
+  actions), bet-lattice concentration as a live discriminator on its own
+  (only 3 buckets live, ~0 correlation with served scores), competitor-repo
+  recon (dashboard degraded; detail pages 404; only 1 miner meets the
+  manifest standard — us).
+- Poker44.net/miners shows **UID 221 at ~30% emission** = the current
+  winner-take-all recipient. Leaderboard "rank #51" counts stale UIDs; the
+  real bar is the 0.58+ composite band.
+
+### 9.5 The remaining live-side program (unchanged priority)
+
+The population gap is the last unexplained component. The only labeled-ish
+path to it: accumulate distinct live windows (`POKER44_CAPTURE_KEEP` rotation,
+scp weekly), watch per-window score distributions per §6, and — new option —
+observe the public Arena (`poker44.net/poker-gameplay`, a client-rendered
+app) where the live population actually plays; if hand histories become
+browsable there, that is direct live-domain data. Revisit after each cycle's
+round scores post.
