@@ -305,6 +305,14 @@ python research/analyze_live_capture.py 'captures/req_*.json.gz' --benchmark
 - **PM2 env persistence** — the single most costly trap (§4.5). Restart reuses
   the original env; only `pm2 delete` + fresh start clears it. Never pin
   `POKER44_MODEL_*`.
+- **A publish failure must never strand a code deploy** (2026-07-09 incident,
+  fixed in `retrain_daily.sh`): with no git push credential on the VPS, every
+  nightly publish failed and the failure path exited before `pm2 restart` —
+  so the miner served the Jul-6 in-memory 3.1.0 model for rounds R1–R4 of
+  cycle 3 while the verified v4 sat on disk. The running process's version is
+  only visible in its STARTUP banner: if the last `Manifest summary` line in
+  the out-log is older than the last deploy, the deploy did not land. The
+  nightly loop still needs a PAT in the remote URL to auto-publish retrains.
 - **`model_meta.json`** — regenerated each train; its metrics are descriptive
   only. (Older commits carried stale v1 `lodo_*` constants; removed as of this
   log.)
