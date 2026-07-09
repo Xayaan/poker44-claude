@@ -12,7 +12,13 @@
 #   -> refresh MODEL_MANIFEST.json artifact hash
 #   -> commit artifacts and PUSH; only then restart the miner
 # If the gate, training, or push fails: artifacts revert to HEAD and the
-# previous (consistent) model keeps serving.
+# previous (consistent) model keeps serving — BUT a code update pulled by the
+# origin sync still restarts the miner (2026-07-09 incident: the publish step
+# failed on missing git credentials night after night, the failure path never
+# restarted PM2, and a fully-verified new model sat undeployed on disk while
+# the old in-memory process kept serving four rounds). After revert_artifacts
+# the tree equals a PUBLISHED commit, so restarting is always
+# consistency-safe.
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
@@ -24,14 +30,33 @@ GATE_MIN="${GATE_MIN:-0.60}"
 echo "=== $(date -u +%FT%TZ) retrain_daily start (py=$PY) ==="
 
 git fetch origin
+PREV_HEAD="$(git rev-parse HEAD)"
 git reset --hard origin/main
+BASE_HEAD="$(git rev-parse HEAD)"
 echo "base commit: $(git rev-parse --short HEAD)"
+
+restart_miner() {
+    pm2 restart "$PM2_NAME" && pm2 save
+    sleep 8
+    grep -hE "Detector self-check|Manifest summary" ~/.pm2/logs/*out*.log 2>/dev/null | tail -2 || true
+}
+
+# Failure exit that still lands a pending code deploy (tree is at a published
+# commit whenever this is called).
+bail() {
+    echo "$1; previous model keeps serving"
+    if [ "$PREV_HEAD" != "$BASE_HEAD" ]; then
+        echo "code updated this run (${PREV_HEAD:0:7} -> ${BASE_HEAD:0:7}); restarting miner onto published state"
+        restart_miner
+    fi
+    exit 1
+}
 
 "$PY" research/download_benchmark.py
 "$PY" research/build_dataset.py
 
 # --- gate: newest-date out-of-sample check --------------------------------
-"$PY" - <<PYEOF
+if ! "$PY" - <<PYEOF
 import pickle, sys
 import numpy as np
 sys.path.insert(0, ".")
@@ -64,6 +89,9 @@ rew, _ = reward(m.predict_proba(Xt)[:, 1], np.array([r["label"] for r in trecs])
 print(f"GATE newest={newest} oos_reward={rew:.3f} min=${GATE_MIN}")
 sys.exit(0 if rew >= float("${GATE_MIN}") else 1)
 PYEOF
+then
+    bail "GATE FAILED"
+fi
 echo "gate passed"
 
 revert_artifacts() {
@@ -74,12 +102,11 @@ revert_artifacts() {
 # --- full retrain + numpy export (includes sklearn/numpy parity assert) ---
 if ! "$PY" research/train_final.py; then
     revert_artifacts
-    echo "TRAIN FAILED; previous model keeps serving"
-    exit 1
+    bail "TRAIN FAILED"
 fi
 
 # --- refresh manifest artifact hash + verify the artifact loads -----------
-"$PY" - <<'PYEOF'
+if ! "$PY" - <<'PYEOF'
 import hashlib, json, sys
 from pathlib import Path
 sys.path.insert(0, ".")
@@ -93,6 +120,10 @@ check = m.self_check()
 assert check["scores"] is not None
 print("artifact ok:", check)
 PYEOF
+then
+    revert_artifacts
+    bail "MANIFEST REFRESH FAILED"
+fi
 
 # --- publish: served model must equal a public commit ----------------------
 git add poker44/detection/model.pkl poker44/detection/model_v2.npz \
@@ -101,18 +132,21 @@ if git diff --cached --quiet; then
     echo "no artifact changes; nothing to publish"
 else
     git -c user.name="poker44-miner" -c user.email="miner@leadpoet" \
-        commit -q -m "Nightly retrain: $(date -u +%F) benchmark releases"
+        commit -q -m "Nightly retrain: $(date -u +%F) benchmark releases" \
+        || { revert_artifacts; bail "COMMIT FAILED"; }
     if ! git push --no-verify origin main; then
         echo "push rejected; re-syncing and retrying once"
         NEW_HEAD="$(git rev-parse HEAD)"
         git fetch origin && git reset --hard origin/main
-        git cherry-pick "$NEW_HEAD" || { git cherry-pick --abort || true; revert_artifacts; echo "PUSH FAILED; previous model keeps serving"; exit 1; }
-        git push --no-verify origin main || { git reset --hard origin/main; echo "PUSH FAILED; previous model keeps serving"; exit 1; }
+        BASE_HEAD="$(git rev-parse HEAD)"
+        git -c user.name="poker44-miner" -c user.email="miner@leadpoet" \
+            cherry-pick "$NEW_HEAD" \
+            || { git cherry-pick --abort || true; revert_artifacts; bail "PUSH FAILED"; }
+        git push --no-verify origin main \
+            || { git reset --hard origin/main; bail "PUSH FAILED"; }
     fi
     echo "published commit: $(git rev-parse --short HEAD)"
 fi
 
-pm2 restart "$PM2_NAME" && pm2 save
-sleep 8
-grep -hE "Detector self-check|Manifest summary" ~/.pm2/logs/*out*.log 2>/dev/null | tail -2 || true
+restart_miner
 echo "=== $(date -u +%FT%TZ) retrain_daily done ==="
