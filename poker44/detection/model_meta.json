@@ -1,7 +1,7 @@
 {
   "format": "poker44-detection-v1",
   "feature_version": 4,
-  "trained_at": "2026-07-12T01:10:40.146277+00:00",
+  "trained_at": "2026-07-13T01:11:08.332536+00:00",
   "training_dates": [
     "2026-05-26",
     "2026-05-27",
@@ -50,10 +50,11 @@
     "2026-07-09",
     "2026-07-10",
     "2026-07-11",
-    "2026-07-12"
+    "2026-07-12",
+    "2026-07-13"
   ],
-  "n_chunk_groups": 1588,
-  "n_training_rows": 28584,
+  "n_chunk_groups": 1740,
+  "n_training_rows": 31320,
   "n_features_active": 282,
   "live_degenerate_masked": 19,
   "domain_randomization": "each group trains in two views: original benchmark and the live-regime transform (research/live_mimic.py; transform targets are aggregate unlabeled capture statistics \u2014 no validator payload enters training data)",
