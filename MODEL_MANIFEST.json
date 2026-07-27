@@ -1,5 +1,5 @@
 {
-  "artifact_sha256": "9603739bd34f0c5f65eb5c56a60134732f89504ca43cdf23cb3c2ea3beb95afa",
+  "artifact_sha256": "aa21a84bdb58030ace721077e3512e06ff016e35fcfecbb9acde0970971e2fc2",
   "artifact_url": "https://github.com/Xayaan/poker44-claude/raw/main/poker44/detection/model_v2.npz",
   "framework": "numpy (HistGB export, trained with scikit-learn)",
   "implementation_files": [
